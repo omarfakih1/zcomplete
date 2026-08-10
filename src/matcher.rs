@@ -1,10 +1,13 @@
 //! Turning a word the shell could not run into a ranked list of words it can.
 //!
-//! Four ways a typed word can point at a command, strongest first: it is a
-//! prefix of it, it spells out the initials of its hyphenated parts, its letters
-//! appear in order inside it, or it is within a typo or two of it. A weaker kind
-//! of match never outranks a stronger one, so a wildly popular subsequence match
-//! cannot steal a resolution from a plausible prefix match.
+//! Four ways a typed word can point at a command: it is a prefix of it, it
+//! spells out the initials of its hyphenated parts, its letters appear in order
+//! inside it, or it is within a typo or two of it. Each produces a similarity on
+//! one common scale, and frecency multiplies it — the kind of match is evidence,
+//! not a veto. Ranking tiers absolutely instead was a real bug: on a machine
+//! with coreutils installed, `gti` resolved to `gtimeout` rather than `git`,
+//! because a prefix of anything outranked a transposition of the command the
+//! user runs a hundred times a day.
 
 use crate::config::Config;
 use crate::store::{frecency, Entry, Shell, Store};
@@ -18,15 +21,6 @@ pub enum Tier {
 }
 
 impl Tier {
-    fn weight(self) -> f32 {
-        match self {
-            Tier::Prefix => 1.0,
-            Tier::Initials => 0.7,
-            Tier::Subsequence => 0.45,
-            Tier::Typo => 0.35,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Tier::Prefix => "prefix",
@@ -46,6 +40,23 @@ pub struct Hit {
     pub rank: f32,
     /// Edit distance for typo matches, zero for the other tiers.
     pub distance: usize,
+    /// The match had to invent or drop letters to work. Those are only used
+    /// when nothing solid matched, however often the command gets run.
+    speculative: bool,
+}
+
+impl Hit {
+    /// A shortcut the user set by hand. It is not competing with anything.
+    pub fn pinned(name: &str) -> Hit {
+        Hit {
+            name: name.to_owned(),
+            tier: Tier::Prefix,
+            score: f32::INFINITY,
+            rank: 0.0,
+            distance: 0,
+            speculative: false,
+        }
+    }
 }
 
 pub struct Context<'a> {
@@ -75,7 +86,7 @@ pub fn among(query: &str, entries: &[Entry], ctx: &Context, cfg: &Config) -> Vec
         {
             continue;
         }
-        let Some((tier, shape, distance)) = classify(&query, &entry.name, cfg) else {
+        let Some((tier, similarity, distance)) = classify(&query, &entry.name, cfg) else {
             continue;
         };
 
@@ -91,17 +102,22 @@ pub fn among(query: &str, entries: &[Entry], ctx: &Context, cfg: &Config) -> Vec
         hits.push(Hit {
             name: entry.name.clone(),
             tier,
-            // +1 keeps a cold entry from collapsing to zero, so tier order stays
-            // the dominant term until frecency has something to say.
-            score: (base + 1.0) * tier.weight() * shape * (1.0 + 0.5 * confirmed),
+            speculative: tier == Tier::Typo
+                && entry.name.chars().count() != query.chars().count(),
+            // Frecency enters logarithmically on purpose. Multiplying by it
+            // directly lets a much-used command win from far away, while
+            // ignoring it lets an unused binary win on spelling alone.
+            // Compressed, it overturns a moderate similarity gap and not a wide
+            // one.
+            score: (1.0 + base.max(0.0).ln_1p()) * similarity * (1.0 + 0.5 * confirmed),
             rank: base,
             distance,
         });
     }
 
     hits.sort_by(|a, b| {
-        a.tier
-            .cmp(&b.tier)
+        a.speculative
+            .cmp(&b.speculative)
             .then_with(|| b.score.total_cmp(&a.score))
             .then_with(|| a.name.len().cmp(&b.name.len()))
             .then_with(|| a.name.cmp(&b.name))
@@ -109,8 +125,8 @@ pub fn among(query: &str, entries: &[Entry], ctx: &Context, cfg: &Config) -> Vec
     hits
 }
 
-/// Which tier `candidate` matches `query` at, a 0..~1.3 quality factor within
-/// that tier, and the edit distance where the tier is a typo.
+/// How `candidate` matches `query`, how strongly on a 0..1 scale, and the edit
+/// distance where the match is a typo.
 fn classify(query: &str, candidate: &str, cfg: &Config) -> Option<(Tier, f32, usize)> {
     if query.is_empty() || candidate.is_empty() {
         return None;
@@ -122,10 +138,11 @@ fn classify(query: &str, candidate: &str, cfg: &Config) -> Option<(Tier, f32, us
     }
 
     if lower.starts_with(query) {
-        // A word that covers most of its completion is a more confident guess
-        // than three letters pointing at a twenty-letter binary.
+        // Three letters of a twenty-letter binary is weak evidence; most of a
+        // short one is strong. The curve has to fall far enough that `gti` finds
+        // `git` rather than `gtimeout`.
         let coverage = qlen as f32 / clen as f32;
-        return Some((Tier::Prefix, 0.7 + 0.6 * coverage, 0));
+        return Some((Tier::Prefix, 0.35 + 0.65 * coverage, 0));
     }
 
     if let Some(quality) = initials_match(query, &lower) {
@@ -140,8 +157,13 @@ fn classify(query: &str, candidate: &str, cfg: &Config) -> Option<(Tier, f32, us
     if allowed > 0 {
         let distance = edit_distance(query, &lower, allowed);
         if distance <= allowed {
-            let slack = 1.0 - (distance as f32 - 1.0) / (allowed as f32 + 1.0);
-            return Some((Tier::Typo, slack.clamp(0.25, 1.0), distance));
+            // A word of the same length one edit off is a slip of the fingers,
+            // and outranks a short prefix of some much longer name: `gti` means
+            // `git`, not `gtimeout`. One that also changed length is a guess
+            // about a word the user may not have been reaching for at all.
+            let accuracy = 1.0 - distance as f32 / qlen as f32;
+            let agrees = if qlen == clen { 1.05 } else { 0.55 };
+            return Some((Tier::Typo, accuracy * agrees, distance));
         }
     }
 
@@ -166,11 +188,11 @@ fn initials_match(query: &str, candidate: &str) -> Option<f32> {
         return None;
     }
     let exact = initials.chars().count() == query.chars().count();
-    Some(if exact { 1.15 } else { 0.8 })
+    Some(if exact { 0.62 } else { 0.45 })
 }
 
-/// Letters in order, anywhere. Matches that land on word boundaries and stay
-/// close together score better, so `gco` prefers `git-checkout` to `gcloud`.
+/// Letters in order, anywhere. A match that starts at the beginning and stays
+/// tight scores above one scattered through a long name.
 fn subsequence_match(query: &str, candidate: &str) -> Option<f32> {
     let candidate: Vec<char> = candidate.chars().collect();
     let mut at = 0usize;
@@ -192,9 +214,9 @@ fn subsequence_match(query: &str, candidate: &str) -> Option<f32> {
 
     let span = at - first.unwrap_or(0);
     let density = matched as f32 / span.max(1) as f32;
-    let anchored = if first == Some(0) { 0.25 } else { 0.0 };
-    let boundary_bonus = 0.25 * (boundaries as f32 / matched as f32);
-    Some((0.4 + 0.5 * density + anchored + boundary_bonus).min(1.2))
+    let anchored = if first == Some(0) { 0.12 } else { 0.0 };
+    let boundary_bonus = 0.10 * (boundaries as f32 / matched as f32);
+    Some((0.20 + 0.30 * density + anchored + boundary_bonus).min(0.60))
 }
 
 /// Optimal string alignment distance, which unlike plain Levenshtein counts
@@ -283,9 +305,20 @@ mod tests {
     }
 
     #[test]
-    fn a_literal_prefix_outranks_a_clever_reading_of_the_letters() {
-        let store = store_with(&[("docker-compose", 400.0), ("dconf", 1.0)]);
-        assert_eq!(best("dc", &store).as_deref(), Some("dconf"));
+    fn how_you_match_matters_more_than_how_often_you_run_it() {
+        // Equally used: a solid prefix beats the letters merely appearing.
+        let store = store_with(&[("dconf", 20.0), ("docker-compose", 20.0)]);
+        assert_eq!(best("dco", &store).as_deref(), Some("dconf"));
+        // And a deliberate-looking abbreviation beats a thin prefix.
+        assert_eq!(best("dc", &store).as_deref(), Some("docker-compose"));
+
+        // Use can overturn the reading, but only by a wide margin. This is what
+        // keeps `rmd` off a much-used `rm` and on the `rmdir` nobody runs.
+        let store = store_with(&[("rm", 400.0), ("rmdir", 1.0)]);
+        assert_eq!(best("rmd", &store).as_deref(), Some("rmdir"));
+
+        let store = store_with(&[("dconf", 1.0), ("docker-compose", 900.0)]);
+        assert_eq!(best("dc", &store).as_deref(), Some("docker-compose"));
     }
 
     #[test]
@@ -366,6 +399,7 @@ mod tests {
             ("grep", 38.0),
             ("curl", 30.0),
             ("docker-compose", 25.0),
+            ("docker", 30.0),
             ("kubectl", 20.0),
             ("python3", 18.0),
             ("mawk", 3.0),
@@ -388,7 +422,7 @@ mod tests {
             ("cle", Some("clear")),
             ("carg", Some("cargo")),
             ("kubect", Some("kubectl")),
-            ("doc", Some("docker-compose")),
+            ("doc", Some("docker")),
             ("py", Some("python3")),
             ("gre", Some("grep")),
             ("cur", Some("curl")),
@@ -406,9 +440,12 @@ mod tests {
             ("dockr-compose", Some("docker-compose")),
             // initials
             ("dc", Some("docker-compose")),
+            // subsequence
+            ("dkr", Some("docker")),
+            ("kbctl", Some("kubectl")),
             // frecency breaking a tie inside one tier
             ("mak", Some("make")),
-            ("ma", Some("make")),
+            ("ma", Some("man")),
             ("g", Some("git")),
             // a word that is not a command cannot be the answer
             ("clean", Some("clear")),

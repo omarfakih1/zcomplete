@@ -90,19 +90,28 @@ score = rank × 4      if used within the hour
 Commands you run in *this* directory carry extra weight, so `ma` finds `make`
 inside a project and `man` everywhere else.
 
-A typed word is matched against that list four ways, and a weaker kind of match
-never beats a stronger one no matter how popular it is:
+A typed word is matched against that list four ways:
 
-| | example | |
-|---|---|---|
-| prefix | `mkd` → `mkdir` | strongest |
-| initials | `dc` → `docker-compose` | |
-| subsequence | `gco` → `git-checkout` | |
-| typo | `gti` → `git`, `gut` → `git` | weakest |
+| | example |
+|---|---|
+| prefix | `mkd` → `mkdir` |
+| initials | `dc` → `docker-compose` |
+| subsequence | `dkr` → `docker` |
+| typo | `gti` → `git`, `gut` → `git` |
 
-Frecency only breaks ties *within* a tier. Words under two letters are never
-corrected, and a typo has to be within one edit for a short word, two for a long
-one — past that zcomplete says nothing and you get the usual error.
+Each produces a similarity, and the final score is that similarity times the
+*logarithm* of frecency. The compression is the point: how well a word matches
+is the main signal, and how often you run something can overturn a close call
+but not a wide one. Ranking the four kinds absolutely instead sounds tidier and
+is wrong in both directions — with coreutils installed it made `gti` mean
+`gtimeout` rather than `git`; ranking on raw frecency instead made `rmd` mean
+`rm` rather than `rmdir`.
+
+One rule is absolute: a match that had to add or drop letters never displaces
+one that did not. If you typed a genuine prefix of something, you were spelling
+that word. Words under two letters are never corrected, and a typo has to be
+within one edit for a short word, two for a long one — past that zcomplete says
+nothing and you get the usual error.
 
 Two invariants hold in every mode, including `--bypass`:
 
@@ -133,14 +142,18 @@ zcomplete ignore sl          # never suggest sl, ever
 ## Commands
 
 ```
-zcomplete stats              what it has learned, strongest first
-zcomplete query <word>       what a word would resolve to (--score to see why)
-zcomplete query <word> -i    pick from the matches (uses fzf if you have it)
-zcomplete import [shell]     seed from zsh, bash and fish history
-zcomplete forget <command>   unlearn one command, or --all
-zcomplete export             the database as text
-zcomplete on | off           without touching your shell config
-zcomplete doctor             check the installation
+zcomplete stats [-n N]           what it has learned, strongest first
+zcomplete query <word>           what a word would resolve to
+zcomplete query <word> --score   and why, with the tier and the score
+zcomplete query <word> -i        pick from the matches (uses fzf if installed)
+zcomplete import [zsh|bash|fish] seed from shell history (--dry-run to look first)
+zcomplete forget <command>...    unlearn commands, or --all
+zcomplete ignore [<command>...]  list, add to, or --remove from the never-suggest list
+zcomplete bind <word> <command>  pin a shortcut; unbind removes it
+zcomplete mode [safe|unsafe|bypass]
+zcomplete on | off               without touching your shell config
+zcomplete export                 the database as text; import --restore reads it back
+zcomplete doctor                 check the installation
 ```
 
 ## Configuration
@@ -182,16 +195,21 @@ type is about a millisecond. Reproduce with `./tests/bench.sh`.
 
 ## What it does not do
 
-**Corrections run in a subshell.** Both zsh and bash run the not-found handler
-in a forked child, so if the command you meant is a shell function that does
-`cd` or sets a variable, the correction runs but the side effect does not
+**In zsh and bash, corrections run in a subshell.** Both run the not-found
+handler in a forked child, so if the command you meant is a shell function that
+does `cd` or sets a variable, the correction runs but the side effect does not
 survive. External commands, which is nearly all of them, are unaffected.
 
-**In fish, a corrected command always reports exit status 127.** fish discards
-the return value of `fish_command_not_found` and has already decided the line
-failed, so `mkd x && echo done` will not print `done` even though the directory
-was created. Nothing in the tool can change that; zsh and bash both propagate
-the real status.
+**fish is corrected a moment earlier, which means zcomplete binds enter there.**
+fish calls `fish_command_not_found` only after it has given up on the job, with
+stdin and stdout back on the terminal — running the correction from inside it
+would make `printf x | ct` hand `cat` the keyboard and hang the shell, and
+`unam > out.txt` print to the screen. So on fish the command line is rewritten
+before it runs, and fish executes it itself. Pipes, redirections, command
+substitution, job control and `$status` all behave normally, and unlike zsh and
+bash a corrected shell function keeps its side effects. The cost is the key
+binding: if something else in your config rebinds enter after zcomplete loads,
+load zcomplete last.
 
 **bash 3.2 — the bash that ships with macOS — cannot intercept anything.**
 `command_not_found_handle` arrived in bash 4.0. On 3.2 zcomplete still learns,

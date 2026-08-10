@@ -51,6 +51,9 @@ pub fn inspect(command: &str, args: &[String], extra_always: &[String]) -> Optio
     if let Some((_, reason)) = ALWAYS.iter().find(|(name, _)| *name == bare) {
         return Some(Concern { reason });
     }
+    if let Some(reason) = reckless_flag(args) {
+        return Some(Concern { reason });
+    }
 
     let reason = match bare {
         "git" => git(args),
@@ -93,12 +96,37 @@ pub fn inspect(command: &str, args: &[String], extra_always: &[String]) -> Optio
     reason.map(|reason| Concern { reason })
 }
 
+/// Flags that mean "I know this destroys something" on whatever command they
+/// are handed to. Checked before the per-command rules, because the word that
+/// got corrected may not be one we have a rule for.
+fn reckless_flag(args: &[String]) -> Option<&'static str> {
+    if flag(args, &[], &["dry-run"]) {
+        return None;
+    }
+    for arg in args.iter().take_while(|a| *a != "--") {
+        if let Some(long) = arg.strip_prefix("--") {
+            if matches!(
+                long.split('=').next().unwrap_or(long),
+                "force" | "hard" | "no-preserve-root" | "purge" | "destroy" | "wipe"
+            ) {
+                return Some("was given a flag that destroys something");
+            }
+        } else if let Some(cluster) = arg.strip_prefix('-') {
+            // -rf, -fr, -rvf: recursive and forced together is never gentle.
+            if cluster.contains('r') && cluster.contains('f') {
+                return Some("was given -r and -f together");
+            }
+        }
+    }
+    None
+}
+
 fn git(args: &[String]) -> Option<&'static str> {
     let dry_run = flag(args, &['n'], &["dry-run"]);
     if sub(args, "push") && flag(args, &['f'], &["force"]) && !dry_run {
         return Some("force-pushes, rewriting remote history");
     }
-    if sub(args, "reset") && flag(args, &[], &["hard"]) {
+    if sub(args, "reset") && (flag(args, &[], &["hard"]) || flag(args, &[], &["merge"])) {
         return Some("discards uncommitted work");
     }
     if sub(args, "clean") && flag(args, &['f'], &["force"]) && !dry_run {
@@ -110,13 +138,26 @@ fn git(args: &[String]) -> Option<&'static str> {
     if sub(args, "filter-branch") || sub(args, "filter-repo") {
         return Some("rewrites history");
     }
-    if sub(args, "checkout") || sub(args, "restore") {
-        return args
-            .iter()
-            .any(|a| a == "." || a == "--" )
-            .then_some("overwrites local changes");
+    if sub(args, "stash") && (sub(args, "drop") || sub(args, "clear")) {
+        return Some("throws away stashed work");
+    }
+    // `git restore` exists to throw changes away. `git checkout` only does when
+    // it is pointed at a path rather than a branch, which is worth telling
+    // apart: switching branches all day with a prompt each time is useless.
+    if sub(args, "restore") {
+        return Some("discards changes to the files it names");
+    }
+    if sub(args, "checkout") && names_a_path(args) {
+        return Some("overwrites the files it names");
     }
     None
+}
+
+fn names_a_path(args: &[String]) -> bool {
+    args.iter()
+        .skip_while(|a| *a != "checkout")
+        .skip(1)
+        .any(|a| a == "." || a == "--" || (!a.starts_with('-') && std::path::Path::new(a).exists()))
 }
 
 fn permissions(args: &[String]) -> Option<&'static str> {
@@ -234,6 +275,37 @@ mod tests {
         assert!(concern("git", "status").is_none());
         assert!(concern("docker", "ps -a").is_none());
         assert!(concern("kubectl", "get pods").is_none());
+    }
+
+    #[test]
+    fn discarding_local_work_asks_even_without_a_scary_flag() {
+        assert!(concern("git", "restore src/main.rs").is_some());
+        assert!(concern("git", "reset --hard HEAD~1").is_some());
+        assert!(concern("git", "stash drop").is_some());
+        // Switching branches is not destructive and must not nag.
+        assert!(concern("git", "checkout main").is_none());
+        assert!(concern("git", "switch main").is_none());
+        assert!(concern("git", "checkout -b feature").is_none());
+    }
+
+    #[test]
+    fn checkout_of_an_actual_path_is_destructive() {
+        let here = std::env::current_dir().unwrap();
+        let name = std::fs::read_dir(&here)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .find(|n| !n.starts_with('.'))
+            .expect("the working directory has at least one visible entry");
+        assert!(concern("git", &format!("checkout {name}")).is_some());
+        assert!(concern("git", "checkout no-such-file-here-xyzzy").is_none());
+    }
+
+    #[test]
+    fn a_destructive_flag_is_caught_on_a_command_we_have_no_rule_for() {
+        assert!(concern("some-deploy-tool", "--force").is_some());
+        assert!(concern("frobnicate", "-rf /tmp/x").is_some());
+        assert!(concern("frobnicate", "-rv /tmp/x").is_none());
+        assert!(concern("some-deploy-tool", "--force-with-lease").is_none());
     }
 
     #[test]

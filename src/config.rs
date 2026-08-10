@@ -63,6 +63,9 @@ pub struct Config {
     /// Words shorter than this are never corrected; two letters of evidence is
     /// the floor at which a guess is worth making.
     pub min_input: usize,
+    /// How much a use in the current directory counts for, relative to a use
+    /// anywhere. Frecency is compressed logarithmically, so this needs to be
+    /// well above 1 to move anything.
     pub context_weight: f32,
     pub typo_limit: usize,
     /// How many alternatives the picker offers when the top match is not clear.
@@ -84,7 +87,7 @@ impl Default for Config {
             mode: Mode::Safe,
             enabled: true,
             min_input: 2,
-            context_weight: 1.5,
+            context_weight: 4.0,
             typo_limit: 2,
             max_candidates: 5,
             ambiguity: 0.75,

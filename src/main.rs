@@ -34,7 +34,23 @@ impl fmt::Display for Fail {
 
 impl From<std::io::Error> for Fail {
     fn from(err: std::io::Error) -> Fail {
-        Fail(err.to_string())
+        Fail(plain(&err))
+    }
+}
+
+/// An error the user can act on names the thing that failed, not just the
+/// errno: "zcomplete: /nope/seed.tsv: No such file or directory".
+fn at(path: &std::path::Path) -> impl Fn(std::io::Error) -> Fail + '_ {
+    move |err| Fail(format!("{}: {}", path.display(), plain(&err)))
+}
+
+/// Rust renders an OS error as "No such file or directory (os error 2)". The
+/// number is for us, not for whoever is looking at their prompt.
+fn plain(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match text.rfind(" (os error ") {
+        Some(cut) => text[..cut].to_owned(),
+        None => text,
     }
 }
 
@@ -167,21 +183,41 @@ fn retry(args: &[String]) -> Result<i32, Fail> {
     let (flags, operands) = split_flags(args);
     let shell = flag_value(&flags, "--shell").and_then(|s| Shell::parse(&s));
     let line = operands.join(" ");
-    let Some((start, end)) = first_word_span(&line) else {
-        return Ok(NO_MATCH);
-    };
-    let word = &line[start..end];
-    let rest: Vec<String> = line[end..].split_whitespace().map(str::to_owned).collect();
+    // The shell says which words it could not run. Without that we would try to
+    // "fix" its own builtins, which are not on PATH: fish's `set` is one edit
+    // from `sed`.
+    let only: Vec<String> = flag_value(&flags, "--only")
+        .map(|list| list.split(',').map(str::to_owned).collect())
+        .unwrap_or_default();
 
-    match decide(word, &rest, shell, Some(&line))? {
-        Outcome::Run(target) => {
-            println!("{}{}{}", &line[..start], target, &line[end..]);
-            Ok(FOUND)
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut declined = false;
+    for (start, end) in commands_in(&line) {
+        let Some((word_start, word_end)) = word_span(&line, start, end) else {
+            continue;
+        };
+        let word = &line[word_start..word_end];
+        if !only.is_empty() && !only.iter().any(|name| name == word) {
+            continue;
         }
-        Outcome::Nothing => Ok(NO_MATCH),
-        Outcome::Declined => Ok(DECLINED),
-        Outcome::Disabled => Ok(DISABLED),
+        let rest: Vec<String> = line[word_end..end].split_whitespace().map(str::to_owned).collect();
+        match decide(word, &rest, shell, Some(&line))? {
+            Outcome::Run(target) => edits.push((word_start, word_end, target)),
+            Outcome::Declined => declined = true,
+            Outcome::Disabled => return Ok(DISABLED),
+            Outcome::Nothing => {}
+        }
     }
+
+    if edits.is_empty() {
+        return Ok(if declined { DECLINED } else { NO_MATCH });
+    }
+    let mut fixed = line.clone();
+    for (start, end, target) in edits.into_iter().rev() {
+        fixed.replace_range(start..end, &target);
+    }
+    println!("{fixed}");
+    Ok(FOUND)
 }
 
 enum Outcome {
@@ -253,7 +289,7 @@ fn decide(
             None => {
                 // Two refusals of the same guess and we stop making it.
                 db_store.nudge_binding(word, &hits[0].name, -1);
-                db_store.commit()?;
+                db_store.commit().map_err(at(&db))?;
                 return Ok(Outcome::Declined);
             }
         }
@@ -267,7 +303,7 @@ fn decide(
 
     let target = hits[chosen].name.clone();
     remember(&mut db_store, word, &target, dir);
-    db_store.commit()?;
+    db_store.commit().map_err(at(&db))?;
     Ok(Outcome::Run(target))
 }
 
@@ -321,13 +357,7 @@ fn candidates(
             Some(at) => hits.swap(0, at),
             None if runnable(store, pinned, ctx.shell) => hits.insert(
                 0,
-                matcher::Hit {
-                    name: pinned.to_owned(),
-                    tier: matcher::Tier::Prefix,
-                    score: f32::INFINITY,
-                    rank: 0.0,
-                    distance: 0,
-                },
+                matcher::Hit::pinned(pinned),
             ),
             None => {}
         }
@@ -369,13 +399,57 @@ fn ask(
     tty.ask(&question, concern.is_none()).then_some(0)
 }
 
-/// The command word in a raw line, skipping any `FOO=bar` that comes first.
-fn first_word_span(line: &str) -> Option<(usize, usize)> {
-    let mut at = 0;
+/// Where each command in a line begins and ends: the start, and everything
+/// after an unquoted `|`, `&&`, `;` or `(`. Quotes and backslashes are honoured
+/// so a pipe inside a string does not look like a pipeline.
+fn commands_in(line: &str) -> Vec<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut spans = Vec::new();
+    let mut start = None;
+    let (mut single, mut double, mut escaped) = (false, false, false);
+
+    for (at, byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if !single => escaped = true,
+            b'\'' if !double => single = !single,
+            b'"' if !single => double = !double,
+            _ if single || double => {}
+            b'|' | b'&' | b';' | b'(' | b'\n' => {
+                if let Some(from) = start.take() {
+                    spans.push((from, at));
+                }
+            }
+            b' ' | b'\t' => {}
+            _ => {
+                if start.is_none() {
+                    start = Some(at);
+                }
+            }
+        }
+    }
+    if let Some(from) = start {
+        spans.push((from, line.len()));
+    }
+    spans
+}
+
+/// The command word inside `line[from..to]`, skipping the `FOO=bar` assignments
+/// and the wrappers that can come before it.
+fn word_span(line: &str, from: usize, to: usize) -> Option<(usize, usize)> {
+    let mut at = from;
     loop {
-        at += line[at..].len() - line[at..].trim_start().len();
-        let word = line[at..].split_whitespace().next()?;
-        if !word.contains('=') {
+        let segment = line.get(at..to)?;
+        at += segment.len() - segment.trim_start().len();
+        let word = line.get(at..to)?.split_whitespace().next()?;
+        let wrapper = matches!(
+            word,
+            "sudo" | "doas" | "command" | "builtin" | "nohup" | "exec" | "env" | "time" | "nice"
+        );
+        if !wrapper && !word.contains('=') {
             return Some((at, at + word.len()));
         }
         at += word.len();
@@ -383,7 +457,10 @@ fn first_word_span(line: &str) -> Option<(usize, usize)> {
 }
 
 fn rewrite_first(line: &str, target: &str) -> String {
-    match first_word_span(line) {
+    match commands_in(line)
+        .first()
+        .and_then(|(from, to)| word_span(line, *from, *to))
+    {
         Some((start, end)) => format!("{}{target}{}", &line[..start], &line[end..]),
         None => line.to_owned(),
     }
@@ -441,7 +518,7 @@ fn record(args: &[String]) -> Result<i32, Fail> {
     if let Ok(dir) = std::env::current_dir() {
         db_store.bump_in(store::dir_key(&dir), word, 1.0);
     }
-    db_store.commit()?;
+    db_store.commit().map_err(at(&db))?;
     Ok(0)
 }
 
@@ -465,7 +542,12 @@ fn query(args: &[String]) -> Result<i32, Fail> {
         .and_then(|n| n.parse().ok())
         .unwrap_or(if flags.iter().any(|f| f == "--score") { 10 } else { 1 });
 
-    let hits = candidates(word, &ctx, &cfg, db_store.sticky(word));
+    let too_short = db_store.sticky(word).is_none() && word.chars().count() < cfg.min_input;
+    let hits = if too_short || !correctable(word) {
+        Vec::new()
+    } else {
+        candidates(word, &ctx, &cfg, db_store.sticky(word))
+    };
     if hits.is_empty() {
         if shell::on_path(word) {
             eprintln!("zcomplete: '{word}' is already a command");
@@ -617,7 +699,7 @@ fn import(args: &[String]) -> Result<i32, Fail> {
     }
     db_store.compact();
     db_store.touch();
-    db_store.commit()?;
+    db_store.commit().map_err(at(&db))?;
     println!("learned {added} invocations ({skipped} skipped as not installed)");
     Ok(0)
 }
@@ -631,7 +713,7 @@ fn absorb(
     dry: bool,
 ) -> Result<(usize, usize), Fail> {
     let (mut learned, mut missing) = (0, 0);
-    for entry in shell::read_history(shell, path)? {
+    for entry in shell::read_history(shell, path).map_err(at(path))? {
         let Some(word) = shell::command_word(&entry.line) else {
             continue;
         };
@@ -653,7 +735,7 @@ fn absorb(
 }
 
 fn restore(path: &std::path::Path) -> Result<i32, Fail> {
-    let text = std::fs::read_to_string(path)?;
+    let text = std::fs::read_to_string(path).map_err(at(path))?;
     let db = config::db_path();
     let mut db_store = store::edit(&db);
     let mut count = 0;
@@ -669,7 +751,7 @@ fn restore(path: &std::path::Path) -> Result<i32, Fail> {
         db_store.seed(name, Kind::External, rank, last);
         count += 1;
     }
-    db_store.commit()?;
+    db_store.commit().map_err(at(&db))?;
     println!("restored {count} commands");
     Ok(0)
 }
@@ -688,7 +770,7 @@ fn forget(args: &[String]) -> Result<i32, Fail> {
     let mut db_store = store::edit(&db);
     if args.iter().any(|a| a == "--all") {
         db_store.clear();
-        db_store.commit()?;
+        db_store.commit().map_err(at(&db))?;
         println!("database emptied");
         return Ok(0);
     }
@@ -702,7 +784,7 @@ fn forget(args: &[String]) -> Result<i32, Fail> {
             println!("{name} was not in the database");
         }
     }
-    db_store.commit()?;
+    db_store.commit().map_err(at(&db))?;
     Ok(0)
 }
 
@@ -717,7 +799,7 @@ fn bind(args: &[String]) -> Result<i32, Fail> {
     }
     db_store.bump(target, Kind::External, 0.0);
     db_store.nudge_binding(word, target, store::PINNED);
-    db_store.commit()?;
+    db_store.commit().map_err(at(&db))?;
     println!("{word} -> {target}");
     Ok(0)
 }
@@ -729,7 +811,7 @@ fn unbind(args: &[String]) -> Result<i32, Fail> {
     let db = config::db_path();
     let mut db_store = store::edit(&db);
     if db_store.unbind(word) {
-        db_store.commit()?;
+        db_store.commit().map_err(at(&db))?;
         println!("unbound {word}");
         Ok(0)
     } else {
@@ -764,7 +846,7 @@ fn ignore(args: &[String]) -> Result<i32, Fail> {
             println!("ignoring {name}");
         }
     }
-    db_store.commit()?;
+    db_store.commit().map_err(at(&db))?;
     Ok(0)
 }
 
@@ -777,14 +859,17 @@ fn mode(args: &[String]) -> Result<i32, Fail> {
     let Some(mode) = Mode::parse(name) else {
         fail!("unknown mode '{name}' (safe, unsafe or bypass)")
     };
-    let path = cfg.set("mode", &format!("\"{mode}\""))?;
+    let path = cfg
+        .set("mode", &format!("\"{mode}\""))
+        .map_err(at(&config::config_path()))?;
     println!("{mode} - {} ({})", mode.describe(), path.display());
     Ok(0)
 }
 
 fn switch(on: bool) -> Result<i32, Fail> {
     let cfg = Config::load();
-    cfg.set("enabled", if on { "true" } else { "false" })?;
+    cfg.set("enabled", if on { "true" } else { "false" })
+        .map_err(at(&config::config_path()))?;
     println!(
         "corrections {}",
         if on { "enabled" } else { "disabled" }
@@ -928,7 +1013,7 @@ fn split_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
             flags.push(arg.clone());
             let takes_value = matches!(
                 arg.as_str(),
-                "--shell" | "--kind" | "-n" | "--limit" | "--restore"
+                "--shell" | "--kind" | "-n" | "--limit" | "--restore" | "--only"
             );
             if takes_value {
                 if let Some(value) = iter.next() {
@@ -982,6 +1067,33 @@ mod tests {
         assert_eq!(operands, words(&["ls", "-n", "3"]));
     }
 
+    /// The one rule the whole tool rests on: a name only ever leaves here if the
+    /// shell could actually run it. Deleting the `runnable` filter in
+    /// `candidates` used to pass every other test in the suite.
+    #[test]
+    fn a_command_that_is_no_longer_installed_is_not_offered() {
+        let mut store = Store::default();
+        store.bump("definitely-not-installed-xyzzy", Kind::External, 500.0);
+        store.bump("sh", Kind::External, 1.0);
+
+        assert!(!runnable(&store, "definitely-not-installed-xyzzy", None));
+        assert!(runnable(&store, "sh", None));
+        assert!(!runnable(&store, "also-never-installed-xyzzy", None));
+
+        // A shell word is only usable in the shell that defined it.
+        store.bump("mygitfn", Kind::Shell(Shell::Zsh), 5.0);
+        assert!(runnable(&store, "mygitfn", Some(Shell::Zsh)));
+        assert!(!runnable(&store, "mygitfn", Some(Shell::Fish)));
+    }
+
+    #[test]
+    fn errors_name_the_file_and_drop_the_errno() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory (os error 2)");
+        assert_eq!(plain(&err), "No such file or directory");
+        let fail = at(std::path::Path::new("/tmp/seed.tsv"))(err);
+        assert_eq!(fail.to_string(), "/tmp/seed.tsv: No such file or directory");
+    }
+
     #[test]
     fn pathlike_words_are_left_alone() {
         assert!(!correctable("./build"));
@@ -990,6 +1102,34 @@ mod tests {
         assert!(!correctable("-l"));
         assert!(!correctable("sh"), "sh exists, so there is nothing to fix");
         assert!(correctable("mkd"));
+    }
+
+    #[test]
+    fn every_command_in_a_line_is_found() {
+        let spans = |line: &str| {
+            commands_in(line)
+                .into_iter()
+                .filter_map(|(from, to)| {
+                    word_span(line, from, to).map(|(s, e)| line[s..e].to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spans("ls -la"), ["ls"]);
+        assert_eq!(spans("printf hi | ct | wc -l"), ["printf", "ct", "wc"]);
+        assert_eq!(spans("make && ct out.txt"), ["make", "ct"]);
+        assert_eq!(spans("cd /tmp; ls"), ["cd", "ls"]);
+        assert_eq!(spans("FOO=1 sudo mkd thing"), ["mkd"]);
+        // A separator inside quotes is text, not a pipeline.
+        assert_eq!(spans("echo 'a | b'"), ["echo"]);
+        assert_eq!(spans(r#"echo "x; y" && ls"#), ["echo", "ls"]);
+        assert_eq!(spans(r"echo a\|b"), ["echo"]);
+    }
+
+    #[test]
+    fn rewriting_touches_only_the_command_word() {
+        assert_eq!(rewrite_first("mkd 'two words'", "mkdir"), "mkdir 'two words'");
+        assert_eq!(rewrite_first("  mkd x", "mkdir"), "  mkdir x");
+        assert_eq!(rewrite_first("FOO=1 mkd x", "mkdir"), "FOO=1 mkdir x");
     }
 
     #[test]

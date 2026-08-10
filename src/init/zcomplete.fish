@@ -1,10 +1,27 @@
 # zcomplete — fish integration.
 # Loaded by:  zcomplete init fish | source
 #
+# fish is corrected differently from zsh and bash. Their not-found handlers run
+# in the fork that was already going to exec the command, so running something
+# else there inherits the job's pipes and redirections. fish calls
+# fish_command_not_found *after* abandoning the job, with stdin and stdout on the
+# terminal — `echo hi | ct` would hand `cat` the keyboard and hang the shell, and
+# `unam > out.txt` would print to the screen and leave out.txt empty. So the fix
+# happens a moment earlier: enter rewrites the command line and fish runs the
+# corrected line itself, which keeps pipes, redirections, job control and $status
+# behaving exactly as if the right word had been typed.
+#
 # Sourcing this twice is harmless.
 
 if not set -q __zcomplete_builtins
     set -g __zcomplete_builtins (builtin --names)
+end
+
+# Preserve a handler the user already had, unless it is ours from a second load.
+if functions -q fish_command_not_found; and not functions -q __zcomplete_previous
+    if not string match -q '*zcomplete*' -- (functions fish_command_not_found)
+        functions --copy fish_command_not_found __zcomplete_previous
+    end
 end
 
 function __zcomplete_first_word
@@ -37,34 +54,54 @@ function __zcomplete_record --on-event fish_preexec
     command zcomplete record --shell fish --kind $kind -- $word
 end
 
-function fish_command_not_found
-    set -l target ""
-    set -l ret 1
-    if status is-interactive
-        set target (command zcomplete resolve --shell fish -- $argv)
-        set ret $status
+function __zcomplete_execute
+    set -l line (commandline)
+
+    # Cheap gate first: split on the separators a command can follow and see
+    # whether any of them starts with a word this shell cannot run. Only then is
+    # it worth starting a process, so pressing enter on a line that is already
+    # fine costs nothing. zcomplete does the quote-aware scan properly.
+    set -l unknown
+    for part in (string split -- '|' (string replace -ra '[;&()]' '|' -- $line))
+        set -l word (__zcomplete_first_word "$part")
+        if test -n "$word"; and not type -q -- $word
+            set -a unknown $word
+        end
     end
 
-    if test $ret -eq 0 -a -n "$target"
-        $target $argv[2..-1]
+    if set -q unknown[1]
+        set -l fixed (command zcomplete retry --shell fish --only (string join ',' $unknown) -- $line)
+        if test $status -eq 0 -a -n "$fixed"
+            # The store can name a function a config no longer defines.
+            if type -q -- (__zcomplete_first_word "$fixed")
+                commandline --replace -- $fixed
+            end
+        end
+    end
+    commandline -f execute
+end
+
+# Enter arrives as CR from a terminal and as LF from anything feeding fish a
+# script through a pty; bind both, and in vi insert mode as well.
+for key in \r \n
+    bind $key __zcomplete_execute
+    bind -M insert $key __zcomplete_execute
+end
+
+# Still worth defining: the binding only sees the first word of a line the user
+# typed, so anything reaching fish another way lands here. It deliberately does
+# not run the correction - see the note at the top.
+function fish_command_not_found
+    if functions -q __zcomplete_previous
+        __zcomplete_previous $argv
         return $status
     end
-    # 130 is a Ctrl-C at the prompt; the user has already said enough.
-    if test $ret -eq 130
-        return 130
-    end
-
     if functions -q __fish_default_command_not_found_handler
         __fish_default_command_not_found_handler $argv
         return $status
     end
     printf 'fish: Unknown command: %s\n' $argv[1] >&2
     return 127
-end
-
-# fish 3.0 and 3.1 dispatch through the older name.
-function __fish_command_not_found_handler --on-event fish_command_not_found
-    fish_command_not_found $argv
 end
 
 complete -c zcomplete -f

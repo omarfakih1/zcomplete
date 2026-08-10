@@ -58,7 +58,9 @@ command_not_found_handler() {
         ret=1
     fi
 
-    if (( ret == 0 )) && [[ -n $target ]]; then
+    # The store can name a function from a .zshrc that no longer defines it.
+    if (( ret == 0 )) && [[ -n $target ]] &&
+        (( $+commands[$target] + $+functions[$target] + $+aliases[$target] + $+builtins[$target] )); then
         shift
         if (( $+aliases[$target] )); then
             eval -- ${(q)target} ${(q)@}

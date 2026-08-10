@@ -96,13 +96,17 @@ class Session:
         os.write(self.fd, text.encode())
 
     def run(self, command, timeout=TIMEOUT):
-        """Send a command, wait for it to finish, return (output, exit status)."""
+        """Send a command, wait for it to finish, return (output, exit status).
+
+        Lines end in a carriage return, which is what a terminal sends when the
+        user presses enter — fish binds that key, and sending a line feed
+        instead quietly bypassed the binding."""
         self.counter += 1
         marker = f"ZC{self.counter}"
         status = "$status" if self.kind == "fish" else "$?"
         start = len(self.buffer)
-        self.type(f"{command}\n")
-        self.type(f'echo "{marker}:"{status}\n')
+        self.type(f"{command}\r")
+        self.type(f'echo "{marker}:"{status}\r')
         if not self.expect(f"{marker}:", timeout):
             raise AssertionError(f"timed out running {command!r}\n{self.tail()}")
         self.expect("\n", 0.3)
@@ -125,7 +129,7 @@ class Session:
         """Wait for the shell to really exit — bash writes its history on the
         way out, and the temporary home is deleted the moment we return."""
         try:
-            self.type("exit\n")
+            self.type("exit\r")
         except OSError:
             pass
         if not self.reap(1.0):
@@ -242,9 +246,7 @@ class Scenario:
         self.zcomplete(f"--{name}")
 
     def ran(self, code):
-        """fish discards the return value of fish_command_not_found, so a
-        corrected command reports 127 there however well it went."""
-        return code == 0 or (self.kind == "fish" and code == 127)
+        return code == 0
 
 
 CHECKS = []
@@ -318,8 +320,8 @@ def unknown_word_reports_normally(sc):
 def safe_mode_accepts(sc):
     sc.mode("safe")
     sc.session.run("mkdir -p seed")
-    sc.session.type("mkd yes-please\n")
-    assert sc.session.expect("run mkdir instead of"), f"no prompt:\n{sc.session.tail()}"
+    sc.session.type("mkd yes-please\r")
+    assert sc.session.expect("zcomplete: run mkdir"), f"no prompt:\n{sc.session.tail()}"
     sc.session.type("y")
     time.sleep(0.5)
     sc.session.drain(0.5)
@@ -330,8 +332,8 @@ def safe_mode_accepts(sc):
 def safe_mode_declines(sc):
     sc.mode("safe")
     sc.session.run("mkdir -p seed2")
-    sc.session.type("mkd no-thanks\n")
-    assert sc.session.expect("run mkdir instead of"), f"no prompt:\n{sc.session.tail()}"
+    sc.session.type("mkd no-thanks\r")
+    assert sc.session.expect("zcomplete: run mkdir"), f"no prompt:\n{sc.session.tail()}"
     sc.session.type("n")
     time.sleep(0.5)
     sc.session.drain(0.5)
@@ -343,8 +345,8 @@ def declining_twice_buries_it(sc):
     sc.mode("safe")
     sc.session.run("mkdir -p seed3")
     for _ in range(2):
-        sc.session.type("mkd buried\n")
-        sc.session.expect("run mkdir instead of")
+        sc.session.type("mkd buried\r")
+        sc.session.expect("zcomplete: run mkdir")
         sc.session.type("n")
         sc.session.drain(0.4)
     assert sc.zcomplete("query", "mkd").returncode != 0, "mkd should have no candidates left"
@@ -364,7 +366,7 @@ def unsafe_guards_destruction(sc):
     sc.mode("unsafe")
     (sc.home / "victim.txt").write_text("keep me")
     sc.session.run("rm -f nothing-here")
-    sc.session.type("rmx victim.txt\n")
+    sc.session.type("rmx victim.txt\r")
     assert sc.session.expect("deletes files"), f"no danger prompt:\n{sc.session.tail()}"
     sc.session.type("n")
     sc.session.drain(0.5)
@@ -384,8 +386,8 @@ def bypass_asks_nothing(sc):
 def declining_reports_not_found(sc):
     sc.mode("safe")
     sc.session.run("mkdir -p seed6")
-    sc.session.type("mkd nope\n")
-    assert sc.session.expect("run mkdir instead of"), sc.session.tail()
+    sc.session.type("mkd nope\r")
+    assert sc.session.expect("zcomplete: run mkdir"), sc.session.tail()
     sc.session.type("n")
     out, code = sc.session.run("true")
     seen = sc.session.tail().lower()
@@ -406,8 +408,30 @@ def scripts_are_left_alone(sc):
 def pipes_still_work(sc):
     sc.mode("bypass")
     sc.session.run("cat /dev/null")
-    out, code = sc.session.run("echo hello | ct")
-    assert "hello" in out, f"stdin did not reach cat: {out!r}"
+    # The payload must not appear in the line as typed, or the echoed command
+    # makes the assertion pass while the shell is actually wedged.
+    out, code = sc.session.run("printf 'PIP''EOK\\n' | ct")
+    assert "PIPEOK" in out, f"stdin did not reach cat: {out!r}"
+
+
+@check("redirection of a corrected command still redirects")
+def redirection_still_works(sc):
+    sc.mode("bypass")
+    sc.session.run("cat /dev/null")
+    sc.session.run("ct /dev/null > written.txt")
+    sc.session.run("true")
+    assert (sc.home / "written.txt").exists(), "the redirect never happened"
+
+
+@check("a corrected command inside a substitution is captured")
+def substitution_still_captures(sc):
+    sc.mode("bypass")
+    sc.session.run("printf ok > payload.txt")
+    sc.session.run("cat /dev/null")
+    grab = "set got (ct payload.txt)" if sc.kind == "fish" else "got=$(ct payload.txt)"
+    sc.session.run(grab)
+    out, code = sc.session.run("echo [$got]")
+    assert "[ok]" in out, f"substitution captured {out!r}"
 
 
 @check("sourcing the integration twice changes nothing")
@@ -475,6 +499,35 @@ def concurrent_writes_all_land():
         rank = next((float(l.split("\t")[1]) for l in dump.splitlines() if l.startswith("mkdir\t")), 0)
         assert rank == 400, f"expected 400 increments, kept {rank}"
         assert not list(Path(f"{tmp}/data").glob("*.lock")), "a lock file was left behind"
+
+
+def only_real_commands_are_offered():
+    """The core invariant, end to end: a heavily-used word that is not installed
+    must never win over a barely-used word that is. Built as a mutation test —
+    removing the executability filter has to make this fail."""
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        env = dict(
+            os.environ,
+            PATH=str(build_path(home)),
+            ZCOMPLETE_DATA_DIR=f"{tmp}/data",
+            ZCOMPLETE_CONFIG=f"{tmp}/c.toml",
+        )
+        binary = str(BIN / "zcomplete")
+        seed = home / "seed.tsv"
+        seed.write_text(
+            "".join(f"{n}\t500.000\t{int(time.time())}\n" for n in ("clean", "gitx", "mkdirp"))
+            + "".join(f"{n}\t2.000\t{int(time.time())}\n" for n in ("clear", "git", "mkdir"))
+        )
+        subprocess.run([binary, "import", "--restore", str(seed)], capture_output=True, env=env)
+
+        for typed, want in (("cle", "clear"), ("git", "git"), ("mkd", "mkdir")):
+            got = subprocess.run(
+                [binary, "query", typed, "-n", "9"], capture_output=True, text=True, env=env
+            ).stdout.split()
+            assert want in got, f"{typed} should reach {want}, got {got}"
+            for name in got:
+                assert shutil.which(name, path=env["PATH"]), f"{typed} offered {name}, which is not a command"
 
 
 def main():

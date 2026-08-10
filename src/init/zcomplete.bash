@@ -68,7 +68,7 @@ __zcomplete_record() {
     # rewritten line sticks.
     if [ "${BASH_VERSINFO[0]}" -lt 4 ] && [ "$__zc_exit" -eq 127 ] &&
         ! type "$word" >/dev/null 2>&1; then
-        fixed=$(command zcomplete retry --shell bash -- "$typed")
+        fixed=$(command zcomplete retry --shell bash --only "$word" -- "$typed")
         if [ $? -eq 0 ] && [ -n "$fixed" ]; then
             eval "$fixed"
             return $?
@@ -102,7 +102,8 @@ command_not_found_handle() {
         *) ret=1 ;;
     esac
 
-    if [ $ret -eq 0 ] && [ -n "$target" ]; then
+    # The store can name a function from a .bashrc that no longer defines it.
+    if [ $ret -eq 0 ] && [ -n "$target" ] && type "$target" >/dev/null 2>&1; then
         shift
         if alias "$target" >/dev/null 2>&1; then
             eval -- "$(printf '%q ' "$target" "$@")"
