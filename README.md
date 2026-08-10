@@ -164,7 +164,7 @@ zcomplete doctor                 check the installation
 mode = "safe"            # safe | unsafe | bypass
 enabled = true
 min_input = 2            # never correct a word shorter than this
-context_weight = 1.5     # how much this directory's history counts
+context_weight = 4.0     # how much a use in this directory counts for
 typo_limit = 2           # maximum edit distance, 0 disables typo matching
 max_candidates = 5       # size of the picker when the match is unclear
 ambiguity = 0.75         # runner-up this close to the winner means "ask"
@@ -173,8 +173,10 @@ color = "auto"           # auto | always | never
 always_confirm = []      # extra commands to prompt for in unsafe mode
 ```
 
-Environment: `ZCOMPLETE_MODE`, `ZCOMPLETE_DISABLE`, `ZCOMPLETE_CONFIG`,
-`ZCOMPLETE_DATA_DIR`. `XDG_CONFIG_HOME` and `XDG_DATA_HOME` are honoured;
+Environment: `ZCOMPLETE_MODE` overrides the mode for one command,
+`ZCOMPLETE_DISABLE` switches it off, `ZCOMPLETE_CONFIG` and `ZCOMPLETE_DATA_DIR`
+move the files. `NO_COLOR` is respected, `HISTFILE` is read by `import`, and
+`XDG_CONFIG_HOME` and `XDG_DATA_HOME` are honoured;
 otherwise the database lives in `~/.local/share/zcomplete/commands.bin`, mode
 0600, and holds command names only — never arguments.
 
