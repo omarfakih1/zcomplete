@@ -478,8 +478,7 @@ fn correctable(word: &str) -> bool {
     !word.is_empty()
         && !word.contains('/')
         && !word.contains('=')
-        && !word.starts_with('-')
-        && !word.starts_with('.')
+        && !word.starts_with(['-', '.', '#'])
         && !shell::on_path(word)
 }
 
