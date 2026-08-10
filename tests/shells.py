@@ -455,6 +455,28 @@ def pinned_shortcut_wins(sc):
     assert (sc.home / "pinned-dir").is_dir(), "bound shortcut did not run"
 
 
+def concurrent_writes_all_land():
+    """Eight shells recording at once must not lose each other's counts. The
+    lock has to span the read as well as the write, which it did not at first:
+    260 of 400 increments went missing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, ZCOMPLETE_DATA_DIR=f"{tmp}/data", ZCOMPLETE_CONFIG=f"{tmp}/c.toml")
+        binary = str(BIN / "zcomplete")
+        workers = [
+            subprocess.Popen(
+                ["sh", "-c", f'for i in $(seq 50); do "{binary}" record --shell zsh --kind auto -- mkdir; done'],
+                env=env,
+            )
+            for _ in range(8)
+        ]
+        for worker in workers:
+            worker.wait()
+        dump = subprocess.run([binary, "export"], capture_output=True, text=True, env=env).stdout
+        rank = next((float(l.split("\t")[1]) for l in dump.splitlines() if l.startswith("mkdir\t")), 0)
+        assert rank == 400, f"expected 400 increments, kept {rank}"
+        assert not list(Path(f"{tmp}/data").glob("*.lock")), "a lock file was left behind"
+
+
 def main():
     args = sys.argv[1:]
     only = None
@@ -468,6 +490,13 @@ def main():
         sys.exit("build first: cargo build --release")
 
     failures = 0
+    try:
+        concurrent_writes_all_land()
+        print("ok    eight shells writing at once lose nothing")
+    except Exception as err:
+        failures += 1
+        print(f"FAIL  eight shells writing at once lose nothing\n      {err}")
+
     for kind in wanted:
         exe = find_shell(kind)
         if not exe:

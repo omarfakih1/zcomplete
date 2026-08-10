@@ -156,6 +156,47 @@ pub fn dir_key(path: &Path) -> u64 {
     hash
 }
 
+/// A store held open for modification, with the file lock kept for the whole
+/// read-modify-write. Two shells running commands at the same moment would
+/// otherwise each load the same file and the second save would drop the first
+/// one's counts.
+pub struct Editing {
+    path: PathBuf,
+    store: Store,
+    lock: Option<Lock>,
+}
+
+pub fn edit(path: &Path) -> Editing {
+    let lock = Lock::take(path);
+    Editing {
+        path: path.to_owned(),
+        store: Store::open(path),
+        lock,
+    }
+}
+
+impl Editing {
+    pub fn commit(mut self) -> io::Result<()> {
+        let result = self.store.write(&self.path);
+        self.lock = None;
+        result
+    }
+}
+
+impl std::ops::Deref for Editing {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+impl std::ops::DerefMut for Editing {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+}
+
 impl Store {
     pub fn open(path: &Path) -> Store {
         let bytes = match fs::read(path) {
@@ -368,7 +409,7 @@ impl Store {
 
     /// Write through a temporary file in the same directory so a reader either
     /// sees the old database or the new one, never half of either.
-    pub fn save(&self, path: &Path) -> io::Result<()> {
+    fn write(&self, path: &Path) -> io::Result<()> {
         if !self.dirty || self.read_only {
             return Ok(());
         }
@@ -379,7 +420,6 @@ impl Store {
                 .mode(0o700)
                 .create(parent)?;
         }
-        let _guard = Lock::take(path)?;
 
         let temp = path.with_extension(format!("tmp.{}", std::process::id()));
         let written = (|| {
@@ -559,40 +599,50 @@ fn decode(bytes: &[u8]) -> Field<Store> {
 }
 
 /// Advisory lock around the read-modify-write window. Shells fire commands fast
-/// enough that two saves can genuinely overlap.
+/// enough that two of them genuinely overlap, and without this the second one
+/// to save silently discards the first one's counts.
 struct Lock(PathBuf);
 
+/// Long enough to outlast heavy contention, short enough that a wedged process
+/// cannot stall a prompt for a noticeable time.
+const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(2_000);
+const LOCK_ABANDONED: u64 = 10;
+
 impl Lock {
-    fn take(db: &Path) -> io::Result<Option<Lock>> {
+    fn take(db: &Path) -> Option<Lock> {
         let path = db.with_extension("lock");
-        for attempt in 0..60 {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Ok(Some(Lock(path))),
+        if let Some(parent) = path.parent() {
+            let _ = fs::DirBuilder::new().recursive(true).mode(0o700).create(parent);
+        }
+        let deadline = std::time::Instant::now() + LOCK_PATIENCE;
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Some(Lock(path)),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                    if attempt == 0 && stale(&path) {
+                    if abandoned(&path) {
                         let _ = fs::remove_file(&path);
                         continue;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(3));
+                    if std::time::Instant::now() >= deadline {
+                        // Losing one rank increment beats blocking the prompt.
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
-                // An unwritable data directory is the caller's problem, not ours;
-                // let the save itself produce the real error.
-                Err(_) => return Ok(None),
+                // An unwritable data directory is the caller's problem; let the
+                // save itself produce the real error.
+                Err(_) => return None,
             }
         }
-        Ok(None)
     }
 }
 
-fn stale(path: &Path) -> bool {
-    fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .and_then(|at| at.elapsed().map_err(|_| io::ErrorKind::Other.into()))
-        .map_or(true, |age| age.as_secs() > 10)
+/// A lock file left behind by a process that died holding it.
+fn abandoned(path: &Path) -> bool {
+    match fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(at) => at.elapsed().is_ok_and(|age| age.as_secs() > LOCK_ABANDONED),
+        Err(_) => false,
+    }
 }
 
 impl Drop for Lock {
@@ -615,14 +665,14 @@ mod tests {
     #[test]
     fn round_trips_every_table() {
         let path = scratch("roundtrip");
-        let mut store = Store::default();
+        let mut store = edit(&path);
         store.bump("mkdir", Kind::External, 1.0);
         store.bump("clear", Kind::External, 3.0);
         store.bump("gs", Kind::Shell(Shell::Zsh), 2.0);
         store.bump_in(dir_key(Path::new("/tmp/project")), "make", 1.0);
         store.nudge_binding("mkd", "mkdir", 2);
         store.ignore("sl");
-        store.save(&path).unwrap();
+        store.commit().unwrap();
 
         let back = Store::open(&path);
         assert_eq!(back.entries.len(), 3);
@@ -636,9 +686,9 @@ mod tests {
     #[test]
     fn truncated_file_is_quarantined_not_fatal() {
         let path = scratch("truncated");
-        let mut store = Store::default();
+        let mut store = edit(&path);
         store.bump("mkdir", Kind::External, 1.0);
-        store.save(&path).unwrap();
+        store.commit().unwrap();
 
         let bytes = fs::read(&path).unwrap();
         fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
@@ -659,17 +709,17 @@ mod tests {
     #[test]
     fn a_database_from_the_future_is_left_alone() {
         let path = scratch("future");
-        let mut store = Store::default();
+        let mut store = edit(&path);
         store.bump("mkdir", Kind::External, 1.0);
-        store.save(&path).unwrap();
+        store.commit().unwrap();
         let mut bytes = fs::read(&path).unwrap();
         bytes[4] = 99;
         fs::write(&path, &bytes).unwrap();
 
-        let mut back = Store::open(&path);
+        let mut back = edit(&path);
         assert!(back.is_read_only());
         back.bump("clear", Kind::External, 1.0);
-        back.save(&path).unwrap();
+        back.commit().unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes, "the newer file was clobbered");
     }
 
@@ -677,9 +727,9 @@ mod tests {
     fn the_database_is_not_world_readable() {
         use std::os::unix::fs::PermissionsExt;
         let path = scratch("perms");
-        let mut store = Store::default();
+        let mut store = edit(&path);
         store.bump("mkdir", Kind::External, 1.0);
-        store.save(&path).unwrap();
+        store.commit().unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "mode was {:o}", mode);
     }

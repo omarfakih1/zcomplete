@@ -453,7 +453,7 @@ mod tests {
             seed
         };
         let alphabet = b"abcdefgim-k_rtz3";
-        let mut word = |len: usize, next: &mut dyn FnMut() -> u64| {
+        let word = |len: usize, next: &mut dyn FnMut() -> u64| {
             (0..len)
                 .map(|_| alphabet[(next() % alphabet.len() as u64) as usize] as char)
                 .collect::<String>()

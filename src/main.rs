@@ -208,7 +208,7 @@ fn decide(
     }
 
     let db = config::db_path();
-    let mut db_store = Store::open(&db);
+    let mut db_store = store::edit(&db);
     // A shortcut the user pinned or confirmed repeatedly is not a guess, so it
     // sidesteps both the minimum word length and the matcher entirely.
     let pinned = db_store.sticky(word).map(str::to_owned);
@@ -253,7 +253,7 @@ fn decide(
             None => {
                 // Two refusals of the same guess and we stop making it.
                 db_store.nudge_binding(word, &hits[0].name, -1);
-                db_store.save(&db)?;
+                db_store.commit()?;
                 return Ok(Outcome::Declined);
             }
         }
@@ -267,7 +267,7 @@ fn decide(
 
     let target = hits[chosen].name.clone();
     remember(&mut db_store, word, &target, dir);
-    db_store.save(&db)?;
+    db_store.commit()?;
     Ok(Outcome::Run(target))
 }
 
@@ -433,7 +433,7 @@ fn record(args: &[String]) -> Result<i32, Fail> {
     };
 
     let db = config::db_path();
-    let mut db_store = Store::open(&db);
+    let mut db_store = store::edit(&db);
     if db_store.is_ignored(word) {
         return Ok(0);
     }
@@ -441,7 +441,7 @@ fn record(args: &[String]) -> Result<i32, Fail> {
     if let Ok(dir) = std::env::current_dir() {
         db_store.bump_in(store::dir_key(&dir), word, 1.0);
     }
-    db_store.save(&db)?;
+    db_store.commit()?;
     Ok(0)
 }
 
@@ -591,7 +591,7 @@ fn import(args: &[String]) -> Result<i32, Fail> {
     let dry = flags.iter().any(|f| f == "--dry-run");
 
     let db = config::db_path();
-    let mut db_store = Store::open(&db);
+    let mut db_store = store::edit(&db);
     let mut added = 0usize;
     let mut skipped = 0usize;
 
@@ -617,7 +617,7 @@ fn import(args: &[String]) -> Result<i32, Fail> {
     }
     db_store.compact();
     db_store.touch();
-    db_store.save(&db)?;
+    db_store.commit()?;
     println!("learned {added} invocations ({skipped} skipped as not installed)");
     Ok(0)
 }
@@ -655,7 +655,7 @@ fn absorb(
 fn restore(path: &std::path::Path) -> Result<i32, Fail> {
     let text = std::fs::read_to_string(path)?;
     let db = config::db_path();
-    let mut db_store = Store::open(&db);
+    let mut db_store = store::edit(&db);
     let mut count = 0;
     for line in text.lines() {
         let mut fields = line.split('\t');
@@ -669,7 +669,7 @@ fn restore(path: &std::path::Path) -> Result<i32, Fail> {
         db_store.seed(name, Kind::External, rank, last);
         count += 1;
     }
-    db_store.save(&db)?;
+    db_store.commit()?;
     println!("restored {count} commands");
     Ok(0)
 }
@@ -685,10 +685,10 @@ fn export() -> Result<i32, Fail> {
 
 fn forget(args: &[String]) -> Result<i32, Fail> {
     let db = config::db_path();
-    let mut db_store = Store::open(&db);
+    let mut db_store = store::edit(&db);
     if args.iter().any(|a| a == "--all") {
         db_store.clear();
-        db_store.save(&db)?;
+        db_store.commit()?;
         println!("database emptied");
         return Ok(0);
     }
@@ -702,7 +702,7 @@ fn forget(args: &[String]) -> Result<i32, Fail> {
             println!("{name} was not in the database");
         }
     }
-    db_store.save(&db)?;
+    db_store.commit()?;
     Ok(0)
 }
 
@@ -711,13 +711,13 @@ fn bind(args: &[String]) -> Result<i32, Fail> {
         fail!("bind needs a word and a command, as in `zcomplete bind gs 'git status'`")
     };
     let db = config::db_path();
-    let mut db_store = Store::open(&db);
+    let mut db_store = store::edit(&db);
     if !shell::on_path(target) && db_store.get(target).is_none() {
         fail!("'{target}' is not a command on PATH and is not in the database")
     }
     db_store.bump(target, Kind::External, 0.0);
     db_store.nudge_binding(word, target, store::PINNED);
-    db_store.save(&db)?;
+    db_store.commit()?;
     println!("{word} -> {target}");
     Ok(0)
 }
@@ -727,9 +727,9 @@ fn unbind(args: &[String]) -> Result<i32, Fail> {
         fail!("unbind needs a word")
     };
     let db = config::db_path();
-    let mut db_store = Store::open(&db);
+    let mut db_store = store::edit(&db);
     if db_store.unbind(word) {
-        db_store.save(&db)?;
+        db_store.commit()?;
         println!("unbound {word}");
         Ok(0)
     } else {
@@ -740,7 +740,7 @@ fn unbind(args: &[String]) -> Result<i32, Fail> {
 
 fn ignore(args: &[String]) -> Result<i32, Fail> {
     let db = config::db_path();
-    let mut db_store = Store::open(&db);
+    let mut db_store = store::edit(&db);
     let (flags, names) = split_flags(args);
 
     if names.is_empty() {
@@ -764,7 +764,7 @@ fn ignore(args: &[String]) -> Result<i32, Fail> {
             println!("ignoring {name}");
         }
     }
-    db_store.save(&db)?;
+    db_store.commit()?;
     Ok(0)
 }
 
