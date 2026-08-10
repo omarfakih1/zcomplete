@@ -1,0 +1,20 @@
+[package]
+name = "zcomplete"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Frecency-ranked command resolution for zsh, bash and fish"
+repository = "https://github.com/omarfakih1/zcomplete"
+license = "MIT"
+readme = "README.md"
+keywords = ["cli", "shell", "zsh", "fish", "autocomplete"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+libc = "0.2.189"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
