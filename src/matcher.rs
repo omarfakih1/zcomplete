@@ -102,8 +102,7 @@ pub fn among(query: &str, entries: &[Entry], ctx: &Context, cfg: &Config) -> Vec
         hits.push(Hit {
             name: entry.name.clone(),
             tier,
-            speculative: tier == Tier::Typo
-                && entry.name.chars().count() != query.chars().count(),
+            speculative: tier == Tier::Typo && entry.name.chars().count() != query.chars().count(),
             // Frecency enters logarithmically on purpose. Multiplying by it
             // directly lets a much-used command win from far away, while
             // ignoring it lets an unused binary win on spelling alone.

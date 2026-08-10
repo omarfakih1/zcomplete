@@ -614,11 +614,18 @@ impl Lock {
     fn take(db: &Path) -> Option<Lock> {
         let path = db.with_extension("lock");
         if let Some(parent) = path.parent() {
-            let _ = fs::DirBuilder::new().recursive(true).mode(0o700).create(parent);
+            let _ = fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent);
         }
         let deadline = std::time::Instant::now() + LOCK_PATIENCE;
         loop {
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 Ok(_) => return Some(Lock(path)),
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                     if abandoned(&path) {
@@ -658,7 +665,8 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zcomplete-test-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("zcomplete-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir.join("db.bin")
@@ -722,7 +730,11 @@ mod tests {
         assert!(back.is_read_only());
         back.bump("clear", Kind::External, 1.0);
         back.commit().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), bytes, "the newer file was clobbered");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "the newer file was clobbered"
+        );
     }
 
     #[test]

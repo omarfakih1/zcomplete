@@ -23,7 +23,11 @@ impl Tty {
         // Opening /dev/tty fails with ENXIO when the process has no controlling
         // terminal, which is exactly how we detect CI and cron. Checking
         // isatty(0) would be wrong: stdin is a pipe in the case we care about.
-        let file = File::options().read(true).write(true).open("/dev/tty").ok()?;
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok()?;
         let color = match preference {
             Color::Always => true,
             Color::Never => false,
@@ -92,9 +96,15 @@ impl Tty {
     pub fn choose(&mut self, header: &str, options: &[String]) -> Option<usize> {
         self.say(&format!("{header}\n"));
         for (i, option) in options.iter().enumerate() {
-            self.say(&format!("  {}  {option}\n", self.paint("1", &(i + 1).to_string())));
+            self.say(&format!(
+                "  {}  {option}\n",
+                self.paint("1", &(i + 1).to_string())
+            ));
         }
-        self.say(&format!("{} ", self.paint("2", "pick 1-9, or n to cancel:")));
+        self.say(&format!(
+            "{} ",
+            self.paint("2", "pick 1-9, or n to cancel:")
+        ));
 
         let key = self.key().or_else(|| self.line())?;
         self.say("\n");

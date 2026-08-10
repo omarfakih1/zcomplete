@@ -200,7 +200,10 @@ fn retry(args: &[String]) -> Result<i32, Fail> {
         if !only.is_empty() && !only.iter().any(|name| name == word) {
             continue;
         }
-        let rest: Vec<String> = line[word_end..end].split_whitespace().map(str::to_owned).collect();
+        let rest: Vec<String> = line[word_end..end]
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
         match decide(word, &rest, shell, Some(&line))? {
             Outcome::Run(target) => edits.push((word_start, word_end, target)),
             Outcome::Declined => declined = true,
@@ -256,7 +259,9 @@ fn decide(
         return Ok(Outcome::Nothing);
     }
 
-    let dir = std::env::current_dir().map(|d| store::dir_key(&d)).unwrap_or(0);
+    let dir = std::env::current_dir()
+        .map(|d| store::dir_key(&d))
+        .unwrap_or(0);
     let ctx = Context {
         store: &db_store,
         dir,
@@ -288,7 +293,14 @@ fn decide(
     };
 
     let chosen = if must_ask {
-        match ask(&mut tty, word, &hits, concern.as_ref(), whole_line, ambiguous) {
+        match ask(
+            &mut tty,
+            word,
+            &hits,
+            concern.as_ref(),
+            whole_line,
+            ambiguous,
+        ) {
             Some(picked) => picked,
             None => {
                 // Two refusals of the same guess and we stop making it.
@@ -316,7 +328,9 @@ fn decide(
 /// The command is about to run, so it counts as used — the preexec hook never
 /// saw it, because what the user typed was the word that did not exist.
 fn remember(db_store: &mut Store, word: &str, target: &str, dir: u64) {
-    let kind = db_store.get(target).map_or(Kind::External, |entry| entry.kind);
+    let kind = db_store
+        .get(target)
+        .map_or(Kind::External, |entry| entry.kind);
     db_store.bump(target, kind, 1.0);
     db_store.bump_in(dir, target, 1.0);
     db_store.nudge_binding(word, target, 1);
@@ -325,12 +339,7 @@ fn remember(db_store: &mut Store, word: &str, target: &str, dir: u64) {
 /// What `word` could mean, best first: learned commands that still exist, then
 /// merely-installed ones if nothing learned fits, with any pinned shortcut
 /// pushed to the front.
-fn candidates(
-    word: &str,
-    ctx: &Context,
-    cfg: &Config,
-    pinned: Option<&str>,
-) -> Vec<matcher::Hit> {
+fn candidates(word: &str, ctx: &Context, cfg: &Config, pinned: Option<&str>) -> Vec<matcher::Hit> {
     let store = ctx.store;
     let mut hits = matcher::rank(word, ctx, cfg);
     hits.retain(|hit| runnable(store, &hit.name, ctx.shell));
@@ -361,10 +370,9 @@ fn candidates(
     if let Some(pinned) = pinned {
         match hits.iter().position(|hit| hit.name == pinned) {
             Some(at) => hits.swap(0, at),
-            None if runnable(store, pinned, ctx.shell) => hits.insert(
-                0,
-                matcher::Hit::pinned(pinned),
-            ),
+            None if runnable(store, pinned, ctx.shell) => {
+                hits.insert(0, matcher::Hit::pinned(pinned))
+            }
             None => {}
         }
     }
@@ -534,7 +542,9 @@ fn query(args: &[String]) -> Result<i32, Fail> {
     };
     let cfg = Config::load();
     let db_store = Store::open(&config::db_path());
-    let dir = std::env::current_dir().map(|d| store::dir_key(&d)).unwrap_or(0);
+    let dir = std::env::current_dir()
+        .map(|d| store::dir_key(&d))
+        .unwrap_or(0);
     let ctx = Context {
         store: &db_store,
         dir,
@@ -545,7 +555,11 @@ fn query(args: &[String]) -> Result<i32, Fail> {
     let limit = flag_value(&flags, "-n")
         .or_else(|| flag_value(&flags, "--limit"))
         .and_then(|n| n.parse().ok())
-        .unwrap_or(if flags.iter().any(|f| f == "--score") { 10 } else { 1 });
+        .unwrap_or(if flags.iter().any(|f| f == "--score") {
+            10
+        } else {
+            1
+        });
 
     let too_short = db_store.sticky(word).is_none() && word.chars().count() < cfg.min_input;
     let hits = if too_short || !correctable(word) {
@@ -875,10 +889,7 @@ fn switch(on: bool) -> Result<i32, Fail> {
     let cfg = Config::load();
     cfg.set("enabled", if on { "true" } else { "false" })
         .map_err(at(&config::config_path()))?;
-    println!(
-        "corrections {}",
-        if on { "enabled" } else { "disabled" }
-    );
+    println!("corrections {}", if on { "enabled" } else { "disabled" });
     Ok(0)
 }
 
@@ -893,7 +904,11 @@ fn doctor() -> Result<i32, Fail> {
         println!("  binary          {}", path.display());
     }
     for (label, path) in config::describe_paths() {
-        let mark = if config::exists(&path) { "" } else { "  (not created yet)" };
+        let mark = if config::exists(&path) {
+            ""
+        } else {
+            "  (not created yet)"
+        };
         println!("  {label:<15} {}{mark}", path.display());
     }
     println!("  mode            {} - {}", cfg.mode, cfg.mode.describe());
@@ -909,7 +924,9 @@ fn doctor() -> Result<i32, Fail> {
     }
 
     if db_store.entries.len() < 10 {
-        println!("\n  the database is nearly empty; `zcomplete import` seeds it from shell history");
+        println!(
+            "\n  the database is nearly empty; `zcomplete import` seeds it from shell history"
+        );
         problems += 1;
     }
 
@@ -922,7 +939,10 @@ fn doctor() -> Result<i32, Fail> {
 
     print!("\nterminal        ");
     match term::Tty::open(Color::Auto) {
-        Some(tty) => println!("/dev/tty available, colour {}", if tty.color { "on" } else { "off" }),
+        Some(tty) => println!(
+            "/dev/tty available, colour {}",
+            if tty.color { "on" } else { "off" }
+        ),
         None => {
             println!("no /dev/tty - safe mode cannot ask, so corrections will be skipped");
             problems += 1;
@@ -944,9 +964,9 @@ fn doctor() -> Result<i32, Fail> {
 /// things need attention.
 fn report_shell(shell: Shell) -> i32 {
     let mut problems = 0;
-    let hooked = shell::rc_files(shell).iter().any(|rc| {
-        std::fs::read_to_string(rc).is_ok_and(|text| text.contains("zcomplete init"))
-    });
+    let hooked = shell::rc_files(shell)
+        .iter()
+        .any(|rc| std::fs::read_to_string(rc).is_ok_and(|text| text.contains("zcomplete init")));
     let login = std::env::var("SHELL")
         .ok()
         .as_deref()
@@ -987,7 +1007,11 @@ fn setup_line(shell: Shell) -> &'static str {
 }
 
 fn bash_major() -> Option<u32> {
-    let output = std::process::Command::new("bash").arg("-c").arg("echo $BASH_VERSINFO").output().ok()?;
+    let output = std::process::Command::new("bash")
+        .arg("-c")
+        .arg("echo $BASH_VERSINFO")
+        .output()
+        .ok()?;
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
@@ -1055,7 +1079,8 @@ mod tests {
 
     #[test]
     fn flags_stop_at_the_terminator() {
-        let (flags, operands) = split_flags(&words(&["--shell", "zsh", "--", "rm", "-rf", "build"]));
+        let (flags, operands) =
+            split_flags(&words(&["--shell", "zsh", "--", "rm", "-rf", "build"]));
         assert_eq!(flags, words(&["--shell", "zsh"]));
         assert_eq!(operands, words(&["rm", "-rf", "build"]));
     }
@@ -1093,7 +1118,10 @@ mod tests {
 
     #[test]
     fn errors_name_the_file_and_drop_the_errno() {
-        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory (os error 2)");
+        let err = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        );
         assert_eq!(plain(&err), "No such file or directory");
         let fail = at(std::path::Path::new("/tmp/seed.tsv"))(err);
         assert_eq!(fail.to_string(), "/tmp/seed.tsv: No such file or directory");
@@ -1132,7 +1160,10 @@ mod tests {
 
     #[test]
     fn rewriting_touches_only_the_command_word() {
-        assert_eq!(rewrite_first("mkd 'two words'", "mkdir"), "mkdir 'two words'");
+        assert_eq!(
+            rewrite_first("mkd 'two words'", "mkdir"),
+            "mkdir 'two words'"
+        );
         assert_eq!(rewrite_first("  mkd x", "mkdir"), "  mkdir x");
         assert_eq!(rewrite_first("FOO=1 mkd x", "mkdir"), "FOO=1 mkdir x");
     }

@@ -58,27 +58,30 @@ pub fn inspect(command: &str, args: &[String], extra_always: &[String]) -> Optio
     let reason = match bare {
         "git" => git(args),
         "chmod" | "chown" | "chgrp" => permissions(args),
-        "kill" | "pkill" => {
-            (flag(args, &['9'], &["KILL", "-signal=KILL"]) || args.iter().any(|a| a == "-KILL"))
-                .then_some("sends SIGKILL")
-        }
+        "kill" | "pkill" => (flag(args, &['9'], &["KILL", "-signal=KILL"])
+            || args.iter().any(|a| a == "-KILL"))
+        .then_some("sends SIGKILL"),
         "docker" | "podman" | "nerdctl" => containers(args),
         "kubectl" | "oc" => sub(args, "delete").then_some("deletes cluster resources"),
         "terraform" | "tofu" | "pulumi" => infra(args),
         "npm" | "pnpm" | "yarn" | "bun" => packages(args),
         "pip" | "pip3" | "brew" | "apt" | "apt-get" | "dnf" | "yum" | "pacman" => {
-            (sub(args, "uninstall") || sub(args, "remove") || sub(args, "purge") || sub(args, "autoremove"))
-                .then_some("removes installed packages")
+            (sub(args, "uninstall")
+                || sub(args, "remove")
+                || sub(args, "purge")
+                || sub(args, "autoremove"))
+            .then_some("removes installed packages")
         }
         "redis-cli" => args
             .iter()
             .any(|a| a.eq_ignore_ascii_case("flushall") || a.eq_ignore_ascii_case("flushdb"))
             .then_some("empties the datastore"),
         "psql" | "mysql" | "mariadb" | "sqlite3" | "mongosh" => sql(args),
-        "systemctl" | "launchctl" | "service" => {
-            (sub(args, "disable") || sub(args, "remove") || sub(args, "unload") || sub(args, "mask"))
-                .then_some("changes service state persistently")
-        }
+        "systemctl" | "launchctl" | "service" => (sub(args, "disable")
+            || sub(args, "remove")
+            || sub(args, "unload")
+            || sub(args, "mask"))
+        .then_some("changes service state persistently"),
         "defaults" => sub(args, "delete").then_some("deletes macOS preferences"),
         "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" => piped_installer(args),
         "curl" | "wget" => piped_installer(args),
@@ -230,16 +233,15 @@ fn sql(args: &[String]) -> Option<&'static str> {
 fn piped_installer(args: &[String]) -> Option<&'static str> {
     args.iter()
         .any(|arg| {
-            (arg.contains("curl ") || arg.contains("wget ")) && (arg.contains("| sh") || arg.contains("|sh") || arg.contains("| bash"))
+            (arg.contains("curl ") || arg.contains("wget "))
+                && (arg.contains("| sh") || arg.contains("|sh") || arg.contains("| bash"))
         })
         .then_some("downloads and executes a remote script")
 }
 
 /// Does `name` appear as a subcommand — a bare word, not an option value.
 fn sub(args: &[String], name: &str) -> bool {
-    args.iter()
-        .take_while(|a| *a != "--")
-        .any(|a| a == name)
+    args.iter().take_while(|a| *a != "--").any(|a| a == name)
 }
 
 /// Handles `-rf`, `-r -f`, `--force`, and stops at a `--` terminator.

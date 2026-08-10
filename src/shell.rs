@@ -196,7 +196,16 @@ pub fn command_word(line: &str) -> Option<&str> {
         let word = rest.split_whitespace().next()?;
         let wrapper = matches!(
             word,
-            "sudo" | "doas" | "command" | "builtin" | "nohup" | "exec" | "env" | "time" | "nice" | "stdbuf"
+            "sudo"
+                | "doas"
+                | "command"
+                | "builtin"
+                | "nohup"
+                | "exec"
+                | "env"
+                | "time"
+                | "nice"
+                | "stdbuf"
         );
         if !wrapper && !word.contains('=') {
             return (!word.is_empty()
@@ -229,7 +238,8 @@ mod tests {
 
     #[test]
     fn reads_extended_and_plain_zsh_history() {
-        let entries = zsh_history(": 1700000000:0;git status\nls -la\n: 1700000005:12;make \\\nall\n");
+        let entries =
+            zsh_history(": 1700000000:0;git status\nls -la\n: 1700000005:12;make \\\nall\n");
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].line, "git status");
         assert_eq!(entries[0].at, Some(1_700_000_000));

@@ -112,8 +112,12 @@ impl Config {
             match key.as_str() {
                 "mode" => cfg.mode = value.str().and_then(Mode::parse).unwrap_or(cfg.mode),
                 "enabled" => cfg.enabled = value.bool().unwrap_or(cfg.enabled),
-                "min_input" => cfg.min_input = value.int().unwrap_or(cfg.min_input as i64).max(1) as usize,
-                "context_weight" => cfg.context_weight = value.num().unwrap_or(cfg.context_weight).max(0.0),
+                "min_input" => {
+                    cfg.min_input = value.int().unwrap_or(cfg.min_input as i64).max(1) as usize
+                }
+                "context_weight" => {
+                    cfg.context_weight = value.num().unwrap_or(cfg.context_weight).max(0.0)
+                }
                 "typo_limit" => cfg.typo_limit = value.int().unwrap_or(2).clamp(0, 3) as usize,
                 "max_candidates" => {
                     cfg.max_candidates = value.int().unwrap_or(5).clamp(1, 9) as usize
@@ -134,7 +138,11 @@ impl Config {
 
         // One-shot overrides, for `ZCOMPLETE_MODE=safe ./deploy.sh` and for
         // switching the whole thing off in a single shell.
-        if let Some(mode) = std::env::var("ZCOMPLETE_MODE").ok().as_deref().and_then(Mode::parse) {
+        if let Some(mode) = std::env::var("ZCOMPLETE_MODE")
+            .ok()
+            .as_deref()
+            .and_then(Mode::parse)
+        {
             cfg.mode = mode;
         }
         if std::env::var_os("ZCOMPLETE_DISABLE").is_some() {
@@ -338,7 +346,10 @@ mod tests {
         assert_eq!(get("enabled").unwrap().bool(), Some(false));
         assert_eq!(get("context_weight").unwrap().num(), Some(2.5));
         assert_eq!(get("max_candidates").unwrap().int(), Some(7));
-        assert_eq!(get("always_confirm").unwrap().list(), ["rm", "dd", "kubectl"]);
+        assert_eq!(
+            get("always_confirm").unwrap().list(),
+            ["rm", "dd", "kubectl"]
+        );
     }
 
     #[test]
