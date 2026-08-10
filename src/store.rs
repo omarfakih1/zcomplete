@@ -603,9 +603,11 @@ fn decode(bytes: &[u8]) -> Field<Store> {
 /// to save silently discards the first one's counts.
 struct Lock(PathBuf);
 
-/// Long enough to outlast heavy contention, short enough that a wedged process
-/// cannot stall a prompt for a noticeable time.
-const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(2_000);
+/// The lock is only ever held for a read-modify-write of a few hundred
+/// kilobytes, so waiting this long already means something is wrong. It used to
+/// be two seconds, which is what a confirmation prompt cost every other shell
+/// back when the lock spanned the question.
+const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(400);
 const LOCK_ABANDONED: u64 = 10;
 
 impl Lock {

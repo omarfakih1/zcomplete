@@ -244,7 +244,11 @@ fn decide(
     }
 
     let db = config::db_path();
-    let mut db_store = store::edit(&db);
+    // Read unlocked. The database must not be held while a human decides
+    // whether to answer the prompt: every other shell's per-command hook would
+    // queue behind their keypress. The increments below re-open it locked, for
+    // the microseconds that actually need it.
+    let db_store = Store::open(&db);
     // A shortcut the user pinned or confirmed repeatedly is not a guess, so it
     // sidesteps both the minimum word length and the matcher entirely.
     let pinned = db_store.sticky(word).map(str::to_owned);
@@ -288,8 +292,9 @@ fn decide(
             Some(picked) => picked,
             None => {
                 // Two refusals of the same guess and we stop making it.
-                db_store.nudge_binding(word, &hits[0].name, -1);
-                db_store.commit().map_err(at(&db))?;
+                let mut writing = store::edit(&db);
+                writing.nudge_binding(word, &hits[0].name, -1);
+                writing.commit().map_err(at(&db))?;
                 return Ok(Outcome::Declined);
             }
         }
@@ -302,8 +307,9 @@ fn decide(
     };
 
     let target = hits[chosen].name.clone();
-    remember(&mut db_store, word, &target, dir);
-    db_store.commit().map_err(at(&db))?;
+    let mut writing = store::edit(&db);
+    remember(&mut writing, word, &target, dir);
+    writing.commit().map_err(at(&db))?;
     Ok(Outcome::Run(target))
 }
 

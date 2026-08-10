@@ -31,12 +31,16 @@ __zcomplete_record() {
     __zcomplete_first_word "$1"
     [[ -n $REPLY && $REPLY != */* ]] || return 0
 
-    if (( $+aliases[$REPLY] + $+functions[$REPLY] + $+builtins[$REPLY] + $+reswords[$REPLY] )); then
+    # Subscripts inside (( )) are evaluated as arithmetic, so $+commands[git-lfs]
+    # asks about a key named "git minus lfs" and quietly answers no. Every
+    # hyphenated command and every alias went unlearned that way.
+    if [[ -n ${aliases[$REPLY]+x}${functions[$REPLY]+x}${builtins[$REPLY]+x} ]]; then
         kind=shell
-    elif (( $+commands[$REPLY] )); then
-        kind=external
     else
-        return 0
+        # $commands is a hash zsh fills at startup, so a tool installed since
+        # then is missing from it. Hand the word over and let zcomplete look at
+        # PATH itself; it refuses to record anything it cannot find.
+        kind=auto
     fi
 
     \command zcomplete record --shell zsh --kind $kind -- $REPLY
@@ -59,10 +63,11 @@ command_not_found_handler() {
     fi
 
     # The store can name a function from a .zshrc that no longer defines it.
-    if (( ret == 0 )) && [[ -n $target ]] &&
-        (( $+commands[$target] + $+functions[$target] + $+aliases[$target] + $+builtins[$target] )); then
+    # `whence` searches for real, unlike the $commands hash, which zsh fills at
+    # startup and which therefore misses anything installed since.
+    if (( ret == 0 )) && [[ -n $target ]] && whence -- "$target" >/dev/null 2>&1; then
         shift
-        if (( $+aliases[$target] )); then
+        if [[ -n ${aliases[$target]+x} ]]; then
             eval -- ${(q)target} ${(q)@}
         else
             "$target" "$@"

@@ -469,6 +469,51 @@ def legacy_bash_falls_back(sc):
         old.close()
 
 
+@check("an open prompt does not stall other shells")
+def a_prompt_does_not_hold_the_database(sc):
+    if sc.kind != "zsh":
+        return
+    sc.mode("safe")
+    sc.session.run("mkdir -p seed-lock")
+    sc.session.type("mkd waiting-on-an-answer\r")
+    assert sc.session.expect("zcomplete: run mkdir"), sc.session.tail()
+    try:
+        # The confirmation used to be inside the write lock, so every command
+        # typed in every other shell waited out the two-second timeout.
+        worst = 0
+        for _ in range(3):
+            started = time.perf_counter()
+            sc.zcomplete("record", "--shell", "zsh", "--kind", "auto", "--", "git")
+            worst = max(worst, (time.perf_counter() - started) * 1000)
+        assert worst < 250, f"a waiting prompt blocked another shell for {worst:.0f}ms"
+    finally:
+        sc.session.type("n")
+        sc.session.drain(0.3)
+
+
+@check("hyphenated commands and shell functions are learned too")
+def awkward_names_are_learned(sc):
+    sc.mode("bypass")
+    hyphen = sc.home / "bin" / "my-tool"
+    hyphen.write_text("#!/bin/sh\necho tool ran\n")
+    hyphen.chmod(0o755)
+    define = (
+        "function my_helper; echo helper ran; end"
+        if sc.kind == "fish"
+        else "my_helper() { echo helper ran; }"
+    )
+    sc.session.run(define)
+    sc.session.run("my-tool")
+    sc.session.run("my_helper")
+
+    learned = [line.split("\t")[0] for line in sc.zcomplete("export").stdout.splitlines()]
+    assert "my-tool" in learned, f"a hyphenated command was not learned: {learned}"
+    assert "my_helper" in learned, f"a shell function was not learned: {learned}"
+
+    out, code = sc.session.run("my-too")
+    assert "tool ran" in out, f"hyphenated correction did not run: {out!r}"
+
+
 @check("a pinned shortcut wins outright")
 def pinned_shortcut_wins(sc):
     sc.mode("bypass")
