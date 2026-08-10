@@ -46,6 +46,14 @@ generalist told to find whatever would most embarrass the author.
 | Safety | (fixed in the same round) | The subcommand check matched a word anywhere in the arguments, so `git commit -m restore` prompted while `git -C /tmp restore file` did not. |
 | Whole | see commits | Preview showed the wrong word replaced when the correction was not first on the line; fish clobbered a user's own enter binding. |
 
+Round two also found the things only a real terminal shows. In fish the
+confirmation was written over the line the user had typed, because fish's
+editor was still drawing and tracking the cursor; it now goes to the alternate
+screen, which the terminal restores byte for byte. fish also counted every
+correction twice, since it rewrites the line before running it and its own hook
+then records the corrected command. And `mkd dir &` printed a question and
+stopped on tty output, leaving a `[Y/n]` nobody could answer.
+
 The ranking round also produced the most useful criticism of the tests: the
 golden table's fixture contained no competitor for most of its rows, so 19 of
 26 cases had exactly one candidate and proved nothing. The fixture now carries
