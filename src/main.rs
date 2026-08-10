@@ -161,7 +161,11 @@ fn resolve(args: &[String]) -> Result<i32, Fail> {
         return Ok(NO_MATCH);
     };
 
-    match decide(word, &operands[1..], shell, None)? {
+    let alone = Caller {
+        line: None,
+        borrowed: false,
+    };
+    match decide(word, &operands[1..], shell, alone)? {
         Outcome::Run(target) => {
             let mut out = std::io::stdout();
             writeln!(out, "{target}")?;
@@ -183,6 +187,8 @@ fn retry(args: &[String]) -> Result<i32, Fail> {
     let (flags, operands) = split_flags(args);
     let shell = flag_value(&flags, "--shell").and_then(|s| Shell::parse(&s));
     let line = operands.join(" ");
+    // fish calls this from a key binding, with its line editor still drawing.
+    let borrowed = flags.iter().any(|f| f == "--inline");
     // The shell says which words it could not run. Without that we would try to
     // "fix" its own builtins, which are not on PATH: fish's `set` is one edit
     // from `sed`.
@@ -204,11 +210,14 @@ fn retry(args: &[String]) -> Result<i32, Fail> {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
-        let within = Line {
-            text: &line,
-            word: (word_start, word_end),
+        let caller = Caller {
+            line: Some(Line {
+                text: &line,
+                word: (word_start, word_end),
+            }),
+            borrowed,
         };
-        match decide(word, &rest, shell, Some(within))? {
+        match decide(word, &rest, shell, caller)? {
             Outcome::Run(target) => edits.push((word_start, word_end, target)),
             Outcome::Declined => declined = true,
             Outcome::Disabled => return Ok(DISABLED),
@@ -235,6 +244,13 @@ struct Line<'a> {
     word: (usize, usize),
 }
 
+/// Where the correction was asked for, so the prompt can show the whole line
+/// and put the screen back if a line editor is watching.
+struct Caller<'a> {
+    line: Option<Line<'a>>,
+    borrowed: bool,
+}
+
 impl Line<'_> {
     fn with(&self, target: &str) -> String {
         format!(
@@ -258,7 +274,7 @@ fn decide(
     word: &str,
     rest: &[String],
     shell: Option<Shell>,
-    within: Option<Line<'_>>,
+    caller: Caller<'_>,
 ) -> Result<Outcome, Fail> {
     let cfg = Config::load();
     if !cfg.enabled {
@@ -299,7 +315,7 @@ fn decide(
 
     // No terminal means a script, a cron job or CI. Silently substituting a
     // different command in somebody's automation is not a feature.
-    let Some(mut tty) = term::Tty::open(cfg.color) else {
+    let Some(mut tty) = term::Tty::open_as(cfg.color, caller.borrowed) else {
         return Ok(Outcome::Nothing);
     };
 
@@ -315,7 +331,14 @@ fn decide(
     };
 
     let chosen = if must_ask {
-        match ask(&mut tty, word, &hits, concern.as_ref(), within, ambiguous) {
+        match ask(
+            &mut tty,
+            word,
+            &hits,
+            concern.as_ref(),
+            caller.line,
+            ambiguous,
+        ) {
             Some(picked) => picked,
             None => {
                 // Two refusals of the same guess and we stop making it.

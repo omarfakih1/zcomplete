@@ -9,17 +9,26 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
 use crate::config::Color;
 
 pub struct Tty {
     file: File,
     pub color: bool,
+    /// A shell's line editor owns the screen and is tracking where the cursor
+    /// is. Anything written has to be taken back before control returns, or the
+    /// editor redraws from a position that no longer exists.
+    borrowed: bool,
+    disturbed: bool,
 }
 
 impl Tty {
     pub fn open(preference: Color) -> Option<Tty> {
+        Tty::open_as(preference, false)
+    }
+
+    pub fn open_as(preference: Color, borrowed: bool) -> Option<Tty> {
         // Opening /dev/tty fails with ENXIO when the process has no controlling
         // terminal, which is exactly how we detect CI and cron. Checking
         // isatty(0) would be wrong: stdin is a pipe in the case we care about.
@@ -36,10 +45,27 @@ impl Tty {
                     && std::env::var("TERM").is_ok_and(|term| term != "dumb")
             }
         };
-        Some(Tty { file, color })
+        Some(Tty {
+            file,
+            color,
+            borrowed,
+            disturbed: false,
+        })
     }
 
     pub fn say(&mut self, text: &str) {
+        if self.borrowed && !self.disturbed {
+            // Ask the question on the alternate screen. The terminal restores
+            // the primary screen byte for byte on the way out, so the editor's
+            // idea of what is drawn and where the cursor sits both survive.
+            // Trying to patch the line up afterwards with save-and-restore does
+            // not work: the question moves the cursor to a row the editor never
+            // hears about, and its next redraw smears from there. This is what
+            // any full-screen fish binding does, fzf included.
+            let _ = self.file.write_all(b"\x1b[?1049h\x1b[H");
+            ALTERNATE.store(self.file.as_raw_fd(), Ordering::Release);
+            self.disturbed = true;
+        }
         let _ = self.file.write_all(text.as_bytes());
         let _ = self.file.flush();
     }
@@ -113,6 +139,16 @@ impl Tty {
     }
 }
 
+impl Drop for Tty {
+    fn drop(&mut self) {
+        if self.disturbed {
+            ALTERNATE.store(-1, Ordering::Release);
+            let _ = self.file.write_all(b"\x1b[?1049l");
+            let _ = self.file.flush();
+        }
+    }
+}
+
 struct Saved {
     fd: i32,
     state: libc::termios,
@@ -120,8 +156,9 @@ struct Saved {
 
 /// Set by `Raw::enter` so a signal arriving mid-prompt can put the terminal
 /// back. Leaving somebody's shell in a non-echoing state is the worst failure
-/// this program could have.
+/// this program could have — and leaving it on the alternate screen is second.
 static PENDING: AtomicPtr<Saved> = AtomicPtr::new(ptr::null_mut());
+static ALTERNATE: AtomicI32 = AtomicI32::new(-1);
 
 struct Raw;
 
@@ -189,6 +226,11 @@ fn restore() {
 }
 
 extern "C" fn rescue(signal: libc::c_int) {
+    let alternate = ALTERNATE.swap(-1, Ordering::AcqRel);
+    if alternate >= 0 {
+        const LEAVE: &[u8] = b"\x1b[?1049l";
+        unsafe { libc::write(alternate, LEAVE.as_ptr().cast(), LEAVE.len()) };
+    }
     let saved = PENDING.swap(ptr::null_mut(), Ordering::AcqRel);
     if !saved.is_null() {
         // Deliberately not freeing: the allocator is not safe to call from a

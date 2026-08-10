@@ -28,6 +28,7 @@ const ALWAYS: &[(&str, &str)] = &[
     ("truncate", "resizes files, discarding the tail"),
     ("killall", "signals every process by that name"),
     ("mkswap", "reformats a device"),
+    ("unlink", "deletes a file"),
 ];
 
 pub struct Concern {
@@ -54,6 +55,9 @@ pub fn inspect(command: &str, args: &[String], extra_always: &[String]) -> Optio
     if let Some(reason) = reckless_flag(args) {
         return Some(Concern { reason });
     }
+    if let Some(reason) = removes_something(args) {
+        return Some(Concern { reason });
+    }
 
     let reason = match bare {
         "git" => git(args),
@@ -64,14 +68,18 @@ pub fn inspect(command: &str, args: &[String], extra_always: &[String]) -> Optio
         "docker" | "podman" | "nerdctl" => containers(args),
         "kubectl" | "oc" => sub(args, "delete").then_some("deletes cluster resources"),
         "terraform" | "tofu" | "pulumi" => infra(args),
-        "npm" | "pnpm" | "yarn" | "bun" => packages(args),
-        "pip" | "pip3" | "brew" | "apt" | "apt-get" | "dnf" | "yum" | "pacman" => {
-            (sub(args, "uninstall")
-                || sub(args, "remove")
-                || sub(args, "purge")
-                || sub(args, "autoremove"))
-            .then_some("removes installed packages")
-        }
+        "npm" | "pnpm" | "yarn" | "bun" | "cargo" | "gem" | "poetry" => packages(args),
+        "crontab" => flag(args, &['r'], &[]).then_some("deletes the crontab"),
+        "pacman" => flag(args, &['R'], &["remove"]).then_some("removes installed packages"),
+        "find" | "fd" => args
+            .iter()
+            .any(|a| a == "-delete" || a == "-exec")
+            .then_some("acts on every file it finds"),
+        "pip" | "pip3" | "brew" | "apt" | "apt-get" | "dnf" | "yum" => (sub(args, "uninstall")
+            || sub(args, "remove")
+            || sub(args, "purge")
+            || sub(args, "autoremove"))
+        .then_some("removes installed packages"),
         "redis-cli" => args
             .iter()
             .any(|a| a.eq_ignore_ascii_case("flushall") || a.eq_ignore_ascii_case("flushdb"))
@@ -99,9 +107,14 @@ pub fn inspect(command: &str, args: &[String], extra_always: &[String]) -> Optio
     reason.map(|reason| Concern { reason })
 }
 
-/// Flags that mean "I know this destroys something" on whatever command they
-/// are handed to. Checked before the per-command rules, because the word that
-/// got corrected may not be one we have a rule for.
+/// Long flags that mean "I know this destroys something" whatever they are
+/// handed to. Checked before the per-command rules, because the word that got
+/// corrected may not be one we have a rule for.
+///
+/// Only long flags: a short cluster containing r and f is `rm -rf`, but it is
+/// also `make -rf Makefile`, `grep -rf patterns .` and `tar -rf archive`. The
+/// commands where `-rf` really means it are in ALWAYS already, and the ones
+/// with their own rules read their own clusters through `flag`.
 fn reckless_flag(args: &[String]) -> Option<&'static str> {
     if flag(args, &[], &["dry-run"]) {
         return None;
@@ -110,15 +123,35 @@ fn reckless_flag(args: &[String]) -> Option<&'static str> {
         if let Some(long) = arg.strip_prefix("--") {
             if matches!(
                 long.split('=').next().unwrap_or(long),
-                "force" | "hard" | "no-preserve-root" | "purge" | "destroy" | "wipe"
+                "force" | "hard" | "no-preserve-root" | "purge" | "destroy" | "wipe" | "delete"
             ) {
                 return Some("was given a flag that destroys something");
             }
-        } else if let Some(cluster) = arg.strip_prefix('-') {
-            // -rf, -fr, -rvf: recursive and forced together is never gentle.
-            if cluster.contains('r') && cluster.contains('f') {
-                return Some("was given -r and -f together");
+        } else if arg == "-delete" {
+            // find's spelling of the same idea.
+            return Some("was given a flag that destroys something");
+        }
+    }
+    None
+}
+
+/// Deletion is usually spelled as a subcommand rather than a flag, and the
+/// subcommand sits among the first bare words: `docker image rm`, `git worktree
+/// remove`, `helm uninstall`. Matching the whole argument list instead would
+/// prompt for `git commit -m "delete the thing"`.
+fn removes_something(args: &[String]) -> Option<&'static str> {
+    let verbs = args
+        .iter()
+        .take_while(|a| *a != "--")
+        .filter(|a| !a.starts_with('-'))
+        .take(3);
+    for verb in verbs {
+        match verb.as_str() {
+            "rm" | "rmi" | "remove" | "delete" | "destroy" | "prune" | "uninstall" => {
+                return Some("removes something")
             }
+            "publish" | "unpublish" | "yank" => return Some("releases to a public registry"),
+            _ => {}
         }
     }
     None
@@ -132,9 +165,15 @@ fn git(args: &[String]) -> Option<&'static str> {
         "push" if flag(args, &['f'], &["force"]) && !dry_run => {
             Some("force-pushes, rewriting remote history")
         }
+        // `git push origin :branch` is how a remote branch gets deleted.
+        "push" if args.iter().any(|a| a.starts_with(':') && a.len() > 1) => {
+            Some("deletes a remote branch")
+        }
         "reset" if flag(args, &[], &["hard", "merge"]) => Some("discards uncommitted work"),
         "clean" if flag(args, &['f'], &["force"]) && !dry_run => Some("deletes untracked files"),
-        "branch" if args.iter().any(|a| a == "-D") => Some("deletes an unmerged branch"),
+        "branch" | "tag" | "worktree" if flag(args, &['d', 'D'], &["delete"]) => {
+            Some("deletes a branch, tag or worktree")
+        }
         "filter-branch" | "filter-repo" => Some("rewrites history"),
         "stash" if sub(args, "drop") || sub(args, "clear") => Some("throws away stashed work"),
         // `git restore` exists to throw changes away, except in the one form
@@ -283,6 +322,35 @@ mod tests {
     }
 
     #[test]
+    fn deletion_spelled_as_a_subcommand_is_still_deletion() {
+        assert!(concern("docker", "rmi myimage").is_some());
+        assert!(concern("docker", "image rm x").is_some());
+        assert!(concern("git", "branch -d topic").is_some());
+        assert!(concern("git", "tag -d v1.0").is_some());
+        assert!(concern("git", "worktree remove wt").is_some());
+        assert!(concern("git", "push --delete origin main").is_some());
+        assert!(concern("git", "push origin :main").is_some());
+        assert!(concern("rsync", "-a --delete src/ dst/").is_some());
+        assert!(concern("find", ". -name *.tmp -delete").is_some());
+        assert!(concern("cargo", "publish").is_some());
+        assert!(concern("crontab", "-r").is_some());
+        assert!(concern("pacman", "-Rns firefox").is_some());
+        assert!(concern("helm", "uninstall release").is_some());
+    }
+
+    #[test]
+    fn a_long_option_is_not_a_cluster_of_short_ones() {
+        // `-filter:v` contains an r and an f and is nothing to do with rm -rf.
+        assert!(concern("ffmpeg", "-i a.mp4 -filter:v scale=2 b.mp4").is_none());
+        assert!(concern("openssl", "req -inform PEM").is_none());
+        assert!(concern("make", "-rf Makefile all").is_none());
+        assert!(concern("grep", "-rf patterns.txt .").is_none());
+        assert!(concern("tar", "-rf archive.tar extra.txt").is_none());
+        assert!(concern("rsync", "-avz src/ dst/").is_none());
+        assert!(concern("git", "commit -m 'delete the old thing'").is_none());
+    }
+
+    #[test]
     fn harmless_neighbours_do_not_ask() {
         assert!(concern("ls", "-la").is_none());
         assert!(concern("rmdir", "empty").is_none());
@@ -326,8 +394,9 @@ mod tests {
 
     #[test]
     fn a_destructive_flag_is_caught_on_a_command_we_have_no_rule_for() {
+        assert!(concern("rm", "-rf build").is_some());
         assert!(concern("some-deploy-tool", "--force").is_some());
-        assert!(concern("frobnicate", "-rf /tmp/x").is_some());
+        assert!(concern("frobnicate", "--force /tmp/x").is_some());
         assert!(concern("frobnicate", "-rv /tmp/x").is_none());
         assert!(concern("some-deploy-tool", "--force-with-lease").is_none());
     }

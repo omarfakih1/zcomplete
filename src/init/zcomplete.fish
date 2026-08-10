@@ -73,13 +73,22 @@ function __zcomplete_rewrite
     end
 
     if set -q unknown[1]
-        set -l fixed (command zcomplete retry --shell fish --only (string join ',' $unknown) -- $line | string collect)
-        if test $status -eq 0 -a -n "$fixed"
+        # zcomplete writes its question straight to the terminal, while fish's
+        # reader still believes it owns that line and knows where the cursor
+        # sits. Save the cursor, give the question the line to itself, then put
+        # the cursor back and wipe what we drew, so fish redraws from exactly
+        # the state it left. This is how any full-screen fish binding behaves;
+        # skip it and the question lands on top of what you typed and the
+        # redraw smears the rest across the screen.
+        set -l fixed (command zcomplete retry --shell fish --inline --only (string join ',' $unknown) -- $line | string collect)
+        set -l answered $status
+        if test $answered -eq 0 -a -n "$fixed"
             # The store can name a function a config no longer defines.
             if type -q -- (__zcomplete_first_word "$fixed")
                 commandline --replace -- $fixed
             end
         end
+        commandline -f repaint
     end
 end
 
