@@ -134,7 +134,7 @@ straight there. Turn the same suggestion down twice and it is never offered
 again. You can also say so directly:
 
 ```bash
-zcomplete bind gs "git"      # gs always means git
+zcomplete bind gs git        # gs always means git
 zcomplete unbind gs
 zcomplete ignore sl          # never suggest sl, ever
 ```

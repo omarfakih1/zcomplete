@@ -809,8 +809,11 @@ fn forget(args: &[String]) -> Result<i32, Fail> {
 
 fn bind(args: &[String]) -> Result<i32, Fail> {
     let [word, target] = args else {
-        fail!("bind needs a word and a command, as in `zcomplete bind gs 'git status'`")
+        fail!("bind needs a word and a command, as in `zcomplete bind gs git`")
     };
+    if target.split_whitespace().count() > 1 {
+        fail!("a shortcut can only point at one command; make '{target}' a shell alias instead")
+    }
     let db = config::db_path();
     let mut db_store = store::edit(&db);
     if !shell::on_path(target) && db_store.get(target).is_none() {
