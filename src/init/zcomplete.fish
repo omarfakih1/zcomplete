@@ -54,15 +54,18 @@ function __zcomplete_record --on-event fish_preexec
     command zcomplete record --shell fish --kind $kind -- $word
 end
 
-function __zcomplete_execute
-    set -l line (commandline)
+function __zcomplete_rewrite
+    # `string collect` keeps a multi-line buffer as one string. Without it fish
+    # splits the command substitution on newlines, the lines arrive as separate
+    # arguments, and a `for` loop's body ends up spliced onto its header.
+    set -l line (commandline | string collect)
 
     # Cheap gate first: split on the separators a command can follow and see
     # whether any of them starts with a word this shell cannot run. Only then is
     # it worth starting a process, so pressing enter on a line that is already
     # fine costs nothing. zcomplete does the quote-aware scan properly.
     set -l unknown
-    for part in (string split -- '|' (string replace -ra '[;&()]' '|' -- $line))
+    for part in (string split -- '|' (string replace -ra '[;&()\n]' '|' -- $line))
         set -l word (__zcomplete_first_word "$part")
         if test -n "$word"; and not type -q -- $word
             set -a unknown $word
@@ -70,7 +73,7 @@ function __zcomplete_execute
     end
 
     if set -q unknown[1]
-        set -l fixed (command zcomplete retry --shell fish --only (string join ',' $unknown) -- $line)
+        set -l fixed (command zcomplete retry --shell fish --only (string join ',' $unknown) -- $line | string collect)
         if test $status -eq 0 -a -n "$fixed"
             # The store can name a function a config no longer defines.
             if type -q -- (__zcomplete_first_word "$fixed")
@@ -78,14 +81,24 @@ function __zcomplete_execute
             end
         end
     end
-    commandline -f execute
 end
 
-# Enter arrives as CR from a terminal and as LF from anything feeding fish a
-# script through a pty; bind both, and in vi insert mode as well.
+# We rewrite the command line and then hand over to whatever enter already did,
+# rather than calling `commandline -f execute` ourselves. fish's own `execute`
+# knows about incomplete commands, abbreviations and history; and a user who has
+# bound enter to something of their own keeps it. Enter arrives as CR from a
+# terminal and as LF from anything feeding fish a script through a pty.
+function __zcomplete_bind_enter --argument-names mode key
+    set -l existing (bind -M $mode $key 2>/dev/null | string replace -r '^bind\s+(--preset\s+)?\S+\s+' '')
+    if test -z "$existing"; or string match -q '*__zcomplete_rewrite*' -- "$existing"
+        set existing execute
+    end
+    bind -M $mode $key __zcomplete_rewrite $existing
+end
+
 for key in \r \n
-    bind $key __zcomplete_execute
-    bind -M insert $key __zcomplete_execute
+    __zcomplete_bind_enter default $key
+    __zcomplete_bind_enter insert $key
 end
 
 # Still worth defining: the binding only sees the first word of a line the user

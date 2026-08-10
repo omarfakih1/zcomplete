@@ -204,7 +204,11 @@ fn retry(args: &[String]) -> Result<i32, Fail> {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
-        match decide(word, &rest, shell, Some(&line))? {
+        let within = Line {
+            text: &line,
+            word: (word_start, word_end),
+        };
+        match decide(word, &rest, shell, Some(within))? {
             Outcome::Run(target) => edits.push((word_start, word_end, target)),
             Outcome::Declined => declined = true,
             Outcome::Disabled => return Ok(DISABLED),
@@ -223,6 +227,24 @@ fn retry(args: &[String]) -> Result<i32, Fail> {
     Ok(FOUND)
 }
 
+/// A command word in its surrounding line, so the prompt can show the whole
+/// line as it would run rather than the word on its own.
+#[derive(Clone, Copy)]
+struct Line<'a> {
+    text: &'a str,
+    word: (usize, usize),
+}
+
+impl Line<'_> {
+    fn with(&self, target: &str) -> String {
+        format!(
+            "{}{target}{}",
+            &self.text[..self.word.0],
+            &self.text[self.word.1..]
+        )
+    }
+}
+
 enum Outcome {
     Run(String),
     Nothing,
@@ -236,7 +258,7 @@ fn decide(
     word: &str,
     rest: &[String],
     shell: Option<Shell>,
-    whole_line: Option<&str>,
+    within: Option<Line<'_>>,
 ) -> Result<Outcome, Fail> {
     let cfg = Config::load();
     if !cfg.enabled {
@@ -293,14 +315,7 @@ fn decide(
     };
 
     let chosen = if must_ask {
-        match ask(
-            &mut tty,
-            word,
-            &hits,
-            concern.as_ref(),
-            whole_line,
-            ambiguous,
-        ) {
+        match ask(&mut tty, word, &hits, concern.as_ref(), within, ambiguous) {
             Some(picked) => picked,
             None => {
                 // Two refusals of the same guess and we stop making it.
@@ -344,7 +359,11 @@ fn candidates(word: &str, ctx: &Context, cfg: &Config, pinned: Option<&str>) -> 
     let mut hits = matcher::rank(word, ctx, cfg);
     hits.retain(|hit| runnable(store, &hit.name, ctx.shell));
 
-    if hits.is_empty() && pinned.is_none() && cfg.path_fallback {
+    // Consult PATH when nothing learned fits, and also when everything learned
+    // is only a guess: a command the user has never run but is one keystroke
+    // away beats one they have run a dozen times and is two.
+    let only_guesses = hits.iter().all(matcher::Hit::is_speculative);
+    if (hits.is_empty() || only_guesses) && pinned.is_none() && cfg.path_fallback {
         let installed: Vec<store::Entry> = shell::path_commands()
             .into_iter()
             .map(|name| store::Entry {
@@ -354,17 +373,23 @@ fn candidates(word: &str, ctx: &Context, cfg: &Config, pinned: Option<&str>) -> 
                 last: 0,
             })
             .collect();
-        hits = matcher::among(word, &installed, ctx, cfg);
+        let mut found = matcher::among(word, &installed, ctx, cfg);
         // Nothing here has been vouched for by use, so the bar is higher: a
         // prefix, or a single-edit slip like `gti` for `git`. Two edits away
         // from a command you have never run is not evidence of anything.
-        hits.retain(|hit| match hit.tier {
+        found.retain(|hit| match hit.tier {
             matcher::Tier::Prefix => true,
             matcher::Tier::Typo => hit.distance <= 1,
             _ => false,
         });
-        hits.truncate(cfg.max_candidates);
-        hits.retain(|hit| shell::on_path(&hit.name));
+        found.retain(|hit| !hits.iter().any(|known| known.name == hit.name));
+        // Only now is it worth a stat call each; the tier filter has to come
+        // first or a handful of loose subsequence matches fill the list and
+        // squeeze out the one-edit match this is here for.
+        found.truncate(cfg.max_candidates);
+        found.retain(|hit| shell::on_path(&hit.name));
+        hits.extend(found);
+        matcher::sort(&mut hits);
     }
 
     if let Some(pinned) = pinned {
@@ -385,7 +410,7 @@ fn ask(
     word: &str,
     hits: &[matcher::Hit],
     concern: Option<&safety::Concern>,
-    whole_line: Option<&str>,
+    within: Option<Line<'_>>,
     ambiguous: bool,
 ) -> Option<usize> {
     let typed = tty.paint("1", word);
@@ -399,8 +424,8 @@ fn ask(
     }
 
     let target = &hits[0].name;
-    let action = match whole_line {
-        Some(line) => format!("run {}", tty.paint("1", &rewrite_first(line, target))),
+    let action = match within {
+        Some(line) => format!("run {}", tty.paint("1", &line.with(target))),
         None => format!("run {} instead of '{typed}'", tty.paint("1", target)),
     };
     let question = match concern {
@@ -467,16 +492,6 @@ fn word_span(line: &str, from: usize, to: usize) -> Option<(usize, usize)> {
             return Some((at, at + word.len()));
         }
         at += word.len();
-    }
-}
-
-fn rewrite_first(line: &str, target: &str) -> String {
-    match commands_in(line)
-        .first()
-        .and_then(|(from, to)| word_span(line, *from, *to))
-    {
-        Some((start, end)) => format!("{}{target}{}", &line[..start], &line[end..]),
-        None => line.to_owned(),
     }
 }
 
@@ -1162,13 +1177,27 @@ mod tests {
     }
 
     #[test]
-    fn rewriting_touches_only_the_command_word() {
+    fn the_prompt_previews_the_word_it_is_actually_replacing() {
+        let preview = |text: &str, typo: &str, target: &str| {
+            let (from, to) = commands_in(text)
+                .into_iter()
+                .filter_map(|(from, to)| word_span(text, from, to))
+                .find(|(from, to)| &text[*from..*to] == typo)
+                .expect("the typo is one of the command words");
+            Line {
+                text,
+                word: (from, to),
+            }
+            .with(target)
+        };
         assert_eq!(
-            rewrite_first("mkd 'two words'", "mkdir"),
+            preview("mkd 'two words'", "mkd", "mkdir"),
             "mkdir 'two words'"
         );
-        assert_eq!(rewrite_first("  mkd x", "mkdir"), "  mkdir x");
-        assert_eq!(rewrite_first("FOO=1 mkd x", "mkdir"), "FOO=1 mkdir x");
+        assert_eq!(preview("  mkd x", "mkd", "mkdir"), "  mkdir x");
+        assert_eq!(preview("FOO=1 mkd x", "mkd", "mkdir"), "FOO=1 mkdir x");
+        // The correction is the second command, so the first is left alone.
+        assert_eq!(preview("printf hi | ct", "ct", "cat"), "printf hi | cat");
     }
 
     #[test]

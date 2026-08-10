@@ -40,12 +40,17 @@ pub struct Hit {
     pub rank: f32,
     /// Edit distance for typo matches, zero for the other tiers.
     pub distance: usize,
-    /// The match had to invent or drop letters to work. Those are only used
-    /// when nothing solid matched, however often the command gets run.
+    /// The match is a guess rather than a slip: it had to invent or drop
+    /// letters, or it is more than one edit away. Those are only used when
+    /// nothing solid matched, however often the command gets run.
     speculative: bool,
 }
 
 impl Hit {
+    pub fn is_speculative(&self) -> bool {
+        self.speculative
+    }
+
     /// A shortcut the user set by hand. It is not competing with anything.
     pub fn pinned(name: &str) -> Hit {
         Hit {
@@ -102,7 +107,11 @@ pub fn among(query: &str, entries: &[Entry], ctx: &Context, cfg: &Config) -> Vec
         hits.push(Hit {
             name: entry.name.clone(),
             tier,
-            speculative: tier == Tier::Typo && entry.name.chars().count() != query.chars().count(),
+            // Two edits away is a different word, not a mistyped one. Without
+            // this, twelve uses of `chmod` beat the `chown` that `chwon` is a
+            // single transposition from.
+            speculative: tier == Tier::Typo
+                && (distance > 1 || entry.name.chars().count() != query.chars().count()),
             // Frecency enters logarithmically on purpose. Multiplying by it
             // directly lets a much-used command win from far away, while
             // ignoring it lets an unused binary win on spelling alone.
@@ -114,6 +123,12 @@ pub fn among(query: &str, entries: &[Entry], ctx: &Context, cfg: &Config) -> Vec
         });
     }
 
+    sort(&mut hits);
+    hits
+}
+
+/// Best first: anything solid before any guess, then score.
+pub fn sort(hits: &mut [Hit]) {
     hits.sort_by(|a, b| {
         a.speculative
             .cmp(&b.speculative)
@@ -121,7 +136,6 @@ pub fn among(query: &str, entries: &[Entry], ctx: &Context, cfg: &Config) -> Vec
             .then_with(|| a.name.len().cmp(&b.name.len()))
             .then_with(|| a.name.cmp(&b.name))
     });
-    hits
 }
 
 /// How `candidate` matches `query`, how strongly on a 0..1 scale, and the edit
@@ -148,25 +162,37 @@ fn classify(query: &str, candidate: &str, cfg: &Config) -> Option<(Tier, f32, us
         return Some((Tier::Initials, quality, 0));
     }
 
+    // A single edit is the likeliest explanation of a near-miss, so it is worth
+    // testing before the looser readings: `pintf` is `printf` with a dropped
+    // letter, not an abbreviation that happens to appear in order.
+    let allowed = cfg.max_typo_distance(qlen);
+    let distance = if allowed > 0 {
+        edit_distance(query, &lower, allowed)
+    } else {
+        usize::MAX
+    };
+    if distance <= 1 {
+        return Some((Tier::Typo, typo_quality(distance, qlen, clen), distance));
+    }
+
     if let Some(quality) = subsequence_match(query, &lower) {
         return Some((Tier::Subsequence, quality, 0));
     }
-
-    let allowed = cfg.max_typo_distance(qlen);
-    if allowed > 0 {
-        let distance = edit_distance(query, &lower, allowed);
-        if distance <= allowed {
-            // A word of the same length one edit off is a slip of the fingers,
-            // and outranks a short prefix of some much longer name: `gti` means
-            // `git`, not `gtimeout`. One that also changed length is a guess
-            // about a word the user may not have been reaching for at all.
-            let accuracy = 1.0 - distance as f32 / qlen as f32;
-            let agrees = if qlen == clen { 1.05 } else { 0.55 };
-            return Some((Tier::Typo, accuracy * agrees, distance));
-        }
+    if distance <= allowed {
+        return Some((Tier::Typo, typo_quality(distance, qlen, clen), distance));
     }
 
     None
+}
+
+/// A word of the same length one edit off is a slip of the fingers, and
+/// outranks a short prefix of some much longer name: `gti` means `git`, not
+/// `gtimeout`. One that also changed length is a guess about a word the user
+/// may not have been reaching for at all.
+fn typo_quality(distance: usize, qlen: usize, clen: usize) -> f32 {
+    let accuracy = 1.0 - distance as f32 / qlen as f32;
+    let agrees = if qlen == clen { 1.05 } else { 0.55 };
+    accuracy * agrees
 }
 
 /// `dc` for `docker-compose`, `gsl` for `git-svn-log`, `p3` for `python3`.
@@ -382,8 +408,10 @@ mod tests {
         assert_eq!(edit_distance("kitten", "sitting", 5), 3);
     }
 
-    /// A plausible shell's worth of history, so the table below is graded
-    /// against competition rather than against one obvious answer.
+    /// A plausible shell's worth of history. The second half is there to give
+    /// every row below something to lose to: a coreutils `gtimeout` beside
+    /// `git`, a `chown` beside `chmod`, a `ctags` beside `cat`. Without them the
+    /// table grades uncontested answers and proves nothing.
     fn realistic() -> Store {
         store_with(&[
             ("git", 400.0),
@@ -409,6 +437,14 @@ mod tests {
             ("clang", 6.0),
             ("md5sum", 5.0),
             ("gcloud", 8.0),
+            ("gtimeout", 0.5),
+            ("gitk", 0.5),
+            ("git-lfs", 0.5),
+            ("chown", 0.5),
+            ("ctags", 0.5),
+            ("less", 2.0),
+            ("mawk", 3.0),
+            ("dconf", 1.0),
         ])
     }
 
@@ -433,7 +469,6 @@ mod tests {
             ("clera", Some("clear")),
             // substitution and doubled or dropped letters
             ("gut", Some("git")),
-            ("gitt", Some("git")),
             ("mkae", Some("make")),
             ("carrgo", Some("cargo")),
             ("dockr-compose", Some("docker-compose")),
@@ -448,7 +483,10 @@ mod tests {
             ("g", Some("git")),
             // a word that is not a command cannot be the answer
             ("clean", Some("clear")),
-            ("gitx", Some("git")),
+            // competition: the popular command must not win from further away
+            ("chwon", Some("chown")),
+            ("cta", Some("cat")),
+            ("dco", Some("docker-compose")),
             // nothing plausible: say nothing
             ("qwzzxv", None),
             ("zzzzzzzz", None),
@@ -467,6 +505,53 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Some words genuinely have two readings — `gitt` is one keystroke from
+    /// both `git` and the `gitk` beside it. Picking a winner there would be
+    /// pretending; what matters is that the right answer is on offer, which is
+    /// what makes the prompt show a menu instead of a yes/no.
+    #[test]
+    fn a_word_with_two_honest_readings_offers_both() {
+        let store = realistic();
+        let cfg = Config::default();
+        let ctx = Context {
+            store: &store,
+            dir: 0,
+            shell: None,
+            now: crate::store::now(),
+        };
+        for (input, wanted) in [("gitt", "git"), ("gitx", "git"), ("lss", "ls")] {
+            let offered: Vec<String> = rank(input, &ctx, &cfg)
+                .into_iter()
+                .take(3)
+                .map(|hit| hit.name)
+                .collect();
+            assert!(
+                offered.iter().any(|name| name == wanted),
+                "{input} should still offer {wanted}, offered {offered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_two_edits_away_never_wins_over_one_a_single_edit_away() {
+        // `chwon` is one transposition from `chown` and two substitutions from
+        // `chmod`. No amount of running chmod makes it the better reading.
+        let store = store_with(&[("chmod", 400.0), ("chown", 0.0)]);
+        assert_eq!(best("chwon", &store).as_deref(), Some("chown"));
+    }
+
+    #[test]
+    fn a_single_edit_is_read_before_a_scattered_abbreviation() {
+        // `pintf` is `printf` missing a letter. Its letters also appear in order
+        // inside `pinentry-tty`, which is not what anyone meant.
+        let store = store_with(&[("pinentry-tty", 300.0), ("printf", 1.0)]);
+        assert_eq!(best("pintf", &store).as_deref(), Some("printf"));
+        // A genuine abbreviation still reads as one.
+        let store = store_with(&[("docker", 5.0), ("kubectl", 5.0)]);
+        assert_eq!(best("dkr", &store).as_deref(), Some("docker"));
+        assert_eq!(best("kbctl", &store).as_deref(), Some("kubectl"));
     }
 
     #[test]

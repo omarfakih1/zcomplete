@@ -469,6 +469,24 @@ def legacy_bash_falls_back(sc):
         old.close()
 
 
+@check("a multi-line command line survives correction")
+def multiline_survives(sc):
+    sc.mode("bypass")
+    sc.session.run("mkdir -p seed-multi")
+    if sc.kind == "fish":
+        # fish splits command substitution on newlines, so the buffer used to
+        # arrive as separate arguments and get joined with spaces: the second
+        # command became an argument to the first.
+        body = "for d in ONE TWO\n    mkd $d\nend"
+    else:
+        body = "for d in ONE TWO; do mkd $d; done"
+    sc.session.run(body, timeout=8)
+    sc.session.run("true")
+    for name in ("ONE", "TWO"):
+        assert (sc.home / name).is_dir(), f"{name} was not created:\n{sc.session.tail()}"
+    assert not (sc.home / "mkd").exists(), "a command word was consumed as an argument"
+
+
 @check("an open prompt does not stall other shells")
 def a_prompt_does_not_hold_the_database(sc):
     if sc.kind != "zsh":

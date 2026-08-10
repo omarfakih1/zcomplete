@@ -39,4 +39,18 @@ every alias and function, had gone unlearned since the first commit.
 Four critics against the repaired build: ranking, fish, safety, and one
 generalist told to find whatever would most embarrass the author.
 
-Verdicts and fixes are recorded in the commit history.
+| Area | Verdict | Gap |
+|---|---|---|
+| Ranking | NOT YET | A learned command two edits away beat the installed one a single edit away, and the right answer was not even offered: `chwon` resolved to a twelve-times-used `chmod` rather than `chown`. Distance two is a different word, not a slip, so it is now a guess — and the installed-but-unlearned pool feeds the same ranking instead of only filling in when nothing was learned. |
+| fish | NOT YET | `commandline` splits on newlines, so a multi-line buffer arrived as separate arguments and was joined with spaces. Every correction inside a `for` block was dead, and Alt-Enter turned the second command into an argument to the first. |
+| Safety | (fixed in the same round) | The subcommand check matched a word anywhere in the arguments, so `git commit -m restore` prompted while `git -C /tmp restore file` did not. |
+| Whole | see commits | Preview showed the wrong word replaced when the correction was not first on the line; fish clobbered a user's own enter binding. |
+
+The ranking round also produced the most useful criticism of the tests: the
+golden table's fixture contained no competitor for most of its rows, so 19 of
+26 cases had exactly one candidate and proved nothing. The fixture now carries
+a `gtimeout` beside `git`, a `chown` beside `chmod`, a `ctags` beside `cat`.
+Three rows changed answer when it did, and two turned out to have no honest
+single answer at all — `gitt` is one keystroke from both `git` and `gitk` — so
+those are now asserted as "both are offered" rather than given a winner the
+code does not deserve.
