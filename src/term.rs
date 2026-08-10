@@ -37,6 +37,12 @@ impl Tty {
             .write(true)
             .open("/dev/tty")
             .ok()?;
+        // A background job owns no terminal even though it can open one. Asking
+        // there stops the job on tty output and leaves the user looking at a
+        // [Y/n] they have no way to answer without fg.
+        if unsafe { libc::tcgetpgrp(file.as_raw_fd()) } != unsafe { libc::getpgrp() } {
+            return None;
+        }
         let color = match preference {
             Color::Always => true,
             Color::Never => false,

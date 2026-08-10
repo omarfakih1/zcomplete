@@ -203,15 +203,19 @@ does `cd` or sets a variable, the correction runs but the side effect does not
 survive. External commands, which is nearly all of them, are unaffected.
 
 **fish is corrected a moment earlier, which means zcomplete binds enter there.**
+
 fish calls `fish_command_not_found` only after it has given up on the job, with
 stdin and stdout back on the terminal — running the correction from inside it
 would make `printf x | ct` hand `cat` the keyboard and hang the shell, and
 `unam > out.txt` print to the screen. So on fish the command line is rewritten
 before it runs, and fish executes it itself. Pipes, redirections, command
 substitution, job control and `$status` all behave normally, and unlike zsh and
-bash a corrected shell function keeps its side effects. The cost is the key
-binding: if something else in your config rebinds enter after zcomplete loads,
-load zcomplete last.
+bash a corrected shell function keeps its side effects. zcomplete chains onto
+whatever enter was already bound to rather than replacing it, so a binding of
+your own still runs; the one thing it cannot survive is being rebound *after*
+it loads, so load it last. The confirmation is asked on the alternate screen,
+the way fzf does, because fish's line editor is still drawing at that moment
+and anything written over it smears the redraw.
 
 **bash 3.2 — the bash that ships with macOS — cannot intercept anything.**
 `command_not_found_handle` arrived in bash 4.0. On 3.2 zcomplete still learns,

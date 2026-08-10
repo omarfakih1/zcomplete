@@ -88,7 +88,6 @@ function __zcomplete_rewrite
                 commandline --replace -- $fixed
             end
         end
-        commandline -f repaint
     end
 end
 

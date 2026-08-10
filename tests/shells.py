@@ -532,6 +532,35 @@ def awkward_names_are_learned(sc):
     assert "tool ran" in out, f"hyphenated correction did not run: {out!r}"
 
 
+@check("a correction is counted once, not twice")
+def counted_once(sc):
+    sc.mode("bypass")
+    sc.session.run("mkdir -p seed-count")
+    rank = lambda: next(
+        (float(l.split("\t")[1]) for l in sc.zcomplete("export").stdout.splitlines()
+         if l.startswith("mkdir\t")),
+        0.0,
+    )
+    before = rank()
+    sc.session.run("mkd counted-once")
+    # fish rewrites the line before running it, so its preexec hook sees the
+    # real command; counting it again inside zcomplete would double it.
+    assert rank() - before == 1.0, f"mkdir went {before} -> {rank()}"
+
+
+@check("a backgrounded typo does not wait on a prompt nobody can answer")
+def background_never_prompts(sc):
+    if sc.kind == "fish":
+        return  # fish corrects before the job is backgrounded at all
+    sc.mode("safe")
+    sc.session.run("mkdir -p seed-bg")
+    out, code = sc.session.run("mkd backgrounded &")
+    sc.session.run("wait")
+    seen = sc.session.tail().lower()
+    assert "[y/n]" not in seen, f"asked a question a background job cannot answer:\n{seen}"
+    assert not (sc.home / "backgrounded").exists(), "corrected without being able to ask"
+
+
 @check("a pinned shortcut wins outright")
 def pinned_shortcut_wins(sc):
     sc.mode("bypass")

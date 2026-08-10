@@ -248,6 +248,8 @@ struct Line<'a> {
 /// and put the screen back if a line editor is watching.
 struct Caller<'a> {
     line: Option<Line<'a>>,
+    /// The shell's line editor is drawing, and it will run - and therefore
+    /// record - the corrected line itself once we hand back.
     borrowed: bool,
 }
 
@@ -358,19 +360,23 @@ fn decide(
 
     let target = hits[chosen].name.clone();
     let mut writing = store::edit(&db);
-    remember(&mut writing, word, &target, dir);
+    remember(&mut writing, word, &target, dir, caller.borrowed);
     writing.commit().map_err(at(&db))?;
     Ok(Outcome::Run(target))
 }
 
 /// The command is about to run, so it counts as used — the preexec hook never
-/// saw it, because what the user typed was the word that did not exist.
-fn remember(db_store: &mut Store, word: &str, target: &str, dir: u64) {
-    let kind = db_store
-        .get(target)
-        .map_or(Kind::External, |entry| entry.kind);
-    db_store.bump(target, kind, 1.0);
-    db_store.bump_in(dir, target, 1.0);
+/// saw it, because what the user typed was the word that did not exist. Except
+/// in fish, where the line is corrected before it runs and the hook therefore
+/// does see the real command; counting it here as well counts it twice.
+fn remember(db_store: &mut Store, word: &str, target: &str, dir: u64, shell_will_count: bool) {
+    if !shell_will_count {
+        let kind = db_store
+            .get(target)
+            .map_or(Kind::External, |entry| entry.kind);
+        db_store.bump(target, kind, 1.0);
+        db_store.bump_in(dir, target, 1.0);
+    }
     db_store.nudge_binding(word, target, 1);
 }
 
@@ -578,6 +584,10 @@ fn query(args: &[String]) -> Result<i32, Fail> {
     let Some(word) = operands.first() else {
         fail!("query needs a word")
     };
+    reject_unknown(
+        &flags,
+        &["--score", "-i", "--interactive", "-n", "--limit", "--shell"],
+    )?;
     let cfg = Config::load();
     let db_store = Store::open(&config::db_path());
     let dir = std::env::current_dir()
@@ -669,6 +679,7 @@ fn pick_with(picker: &std::path::Path, options: &[String]) -> Result<Option<Stri
 
 fn stats(args: &[String]) -> Result<i32, Fail> {
     let (flags, _) = split_flags(args);
+    reject_unknown(&flags, &["-n", "--limit"])?;
     let limit = flag_value(&flags, "-n")
         .and_then(|n| n.parse().ok())
         .unwrap_or(25);
@@ -716,6 +727,7 @@ fn stats(args: &[String]) -> Result<i32, Fail> {
 
 fn import(args: &[String]) -> Result<i32, Fail> {
     let (flags, operands) = split_flags(args);
+    reject_unknown(&flags, &["--restore", "--dry-run"])?;
     if let Some(path) = flag_value(&flags, "--restore") {
         return restore(&PathBuf::from(path));
     }
@@ -881,9 +893,10 @@ fn unbind(args: &[String]) -> Result<i32, Fail> {
 }
 
 fn ignore(args: &[String]) -> Result<i32, Fail> {
+    let (flags, names) = split_flags(args);
+    reject_unknown(&flags, &["--remove", "-r"])?;
     let db = config::db_path();
     let mut db_store = store::edit(&db);
-    let (flags, names) = split_flags(args);
 
     if names.is_empty() {
         if db_store.ignored.is_empty() {
@@ -1067,6 +1080,9 @@ fn ago(seconds: u64) -> String {
     }
 }
 
+/// The options that take a value, so `-n 5` keeps the 5 together with the -n.
+const VALUED: &[&str] = &["--shell", "--kind", "-n", "--limit", "--restore", "--only"];
+
 /// Splits `--flag`/`--flag=value`/`-n 5` from operands, honouring a `--`
 /// terminator so a user's own arguments are never read as ours.
 fn split_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
@@ -1081,10 +1097,7 @@ fn split_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
         }
         if arg.starts_with('-') && arg.len() > 1 {
             flags.push(arg.clone());
-            let takes_value = matches!(
-                arg.as_str(),
-                "--shell" | "--kind" | "-n" | "--limit" | "--restore" | "--only"
-            );
+            let takes_value = VALUED.contains(&arg.as_str());
             if takes_value {
                 if let Some(value) = iter.next() {
                     flags.push(value.clone());
@@ -1095,6 +1108,27 @@ fn split_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
         operands.push(arg.clone());
     }
     (flags, operands)
+}
+
+/// A flag we do not know is a typo or a wrong idea about what this command
+/// takes; either way, running anyway and reporting success is the wrong answer.
+fn reject_unknown(flags: &[String], known: &[&str]) -> Result<(), Fail> {
+    let mut expecting_value = false;
+    for flag in flags {
+        if expecting_value {
+            expecting_value = false;
+            continue;
+        }
+        let name = flag.split('=').next().unwrap_or(flag);
+        if !name.starts_with('-') {
+            continue;
+        }
+        if !known.contains(&name) {
+            fail!("unknown option '{name}' (try `zcomplete help`)")
+        }
+        expecting_value = !flag.contains('=') && VALUED.contains(&name);
+    }
+    Ok(())
 }
 
 fn flag_value(flags: &[String], name: &str) -> Option<String> {

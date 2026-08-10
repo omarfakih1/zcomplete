@@ -78,7 +78,6 @@ pub struct Config {
     pub path_fallback: bool,
     /// Extra commands that always require confirmation, whatever the mode.
     pub always_confirm: Vec<String>,
-    pub source: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -94,7 +93,6 @@ impl Default for Config {
             color: Color::Auto,
             path_fallback: true,
             always_confirm: Vec::new(),
-            source: None,
         }
     }
 }
@@ -106,7 +104,6 @@ impl Config {
         let Ok(text) = fs::read_to_string(&path) else {
             return cfg;
         };
-        cfg.source = Some(path);
 
         for (key, value) in parse(&text) {
             match key.as_str() {
