@@ -12,7 +12,7 @@
 use crate::config::Config;
 use crate::store::{frecency, Entry, Shell, Store};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
     Prefix,
     Initials,

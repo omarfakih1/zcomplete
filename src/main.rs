@@ -279,7 +279,7 @@ fn decide(
     let ambiguous = hits.len() > 1
         && hits[1].tier == hits[0].tier
         && hits[1].score >= cfg.ambiguity * hits[0].score
-        && db_store.sticky(word).is_none();
+        && pinned.is_none();
     let concern = safety::inspect(&hits[0].name, rest, &cfg.always_confirm);
     let must_ask = match cfg.mode {
         Mode::Safe => true,
@@ -932,10 +932,10 @@ fn doctor() -> Result<i32, Fail> {
 
     println!(
         "\n{}",
-        if problems == 0 {
-            "no problems found".to_string()
-        } else {
-            format!("{problems} thing(s) to look at")
+        match problems {
+            0 => "no problems found".to_string(),
+            1 => "one thing to look at".to_string(),
+            n => format!("{n} things to look at"),
         }
     );
     Ok(if problems == 0 { 0 } else { NO_MATCH })
