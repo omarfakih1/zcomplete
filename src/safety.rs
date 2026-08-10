@@ -123,39 +123,51 @@ fn reckless_flag(args: &[String]) -> Option<&'static str> {
 
 fn git(args: &[String]) -> Option<&'static str> {
     let dry_run = flag(args, &['n'], &["dry-run"]);
-    if sub(args, "push") && flag(args, &['f'], &["force"]) && !dry_run {
-        return Some("force-pushes, rewriting remote history");
+    let verb = git_verb(args)?;
+
+    match verb {
+        "push" if flag(args, &['f'], &["force"]) && !dry_run => {
+            Some("force-pushes, rewriting remote history")
+        }
+        "reset" if flag(args, &[], &["hard", "merge"]) => Some("discards uncommitted work"),
+        "clean" if flag(args, &['f'], &["force"]) && !dry_run => Some("deletes untracked files"),
+        "branch" if args.iter().any(|a| a == "-D") => Some("deletes an unmerged branch"),
+        "filter-branch" | "filter-repo" => Some("rewrites history"),
+        "stash" if sub(args, "drop") || sub(args, "clear") => Some("throws away stashed work"),
+        // `git restore` exists to throw changes away, except in the one form
+        // that only unstages. `git checkout` throws them away when it is pointed
+        // at a path rather than a branch, which is worth telling apart:
+        // switching branches all day with a prompt each time is useless.
+        "restore" if !flag(args, &[], &["staged"]) => {
+            Some("discards changes to the files it names")
+        }
+        "checkout" if names_a_path(args, verb) => Some("overwrites the files it names"),
+        _ => None,
     }
-    if sub(args, "reset") && (flag(args, &[], &["hard"]) || flag(args, &[], &["merge"])) {
-        return Some("discards uncommitted work");
-    }
-    if sub(args, "clean") && flag(args, &['f'], &["force"]) && !dry_run {
-        return Some("deletes untracked files");
-    }
-    if sub(args, "branch") && args.iter().any(|a| a == "-D") {
-        return Some("deletes an unmerged branch");
-    }
-    if sub(args, "filter-branch") || sub(args, "filter-repo") {
-        return Some("rewrites history");
-    }
-    if sub(args, "stash") && (sub(args, "drop") || sub(args, "clear")) {
-        return Some("throws away stashed work");
-    }
-    // `git restore` exists to throw changes away. `git checkout` only does when
-    // it is pointed at a path rather than a branch, which is worth telling
-    // apart: switching branches all day with a prompt each time is useless.
-    if sub(args, "restore") {
-        return Some("discards changes to the files it names");
-    }
-    if sub(args, "checkout") && names_a_path(args) {
-        return Some("overwrites the files it names");
+}
+
+/// The subcommand, skipping git's own options and the values they take.
+fn git_verb(args: &[String]) -> Option<&str> {
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            skip_value = matches!(long, "git-dir" | "work-tree" | "namespace" | "exec-path");
+        } else if arg.starts_with('-') {
+            skip_value = matches!(arg.as_str(), "-C" | "-c");
+        } else {
+            return Some(arg);
+        }
     }
     None
 }
 
-fn names_a_path(args: &[String]) -> bool {
+fn names_a_path(args: &[String], verb: &str) -> bool {
     args.iter()
-        .skip_while(|a| *a != "checkout")
+        .skip_while(|a| a.as_str() != verb)
         .skip(1)
         .any(|a| a == "." || a == "--" || (!a.starts_with('-') && std::path::Path::new(a).exists()))
 }
@@ -286,6 +298,16 @@ mod tests {
         assert!(concern("git", "checkout main").is_none());
         assert!(concern("git", "switch main").is_none());
         assert!(concern("git", "checkout -b feature").is_none());
+    }
+
+    #[test]
+    fn a_subcommand_is_the_verb_and_not_any_word_that_looks_like_one() {
+        // The message is an argument, not an instruction to throw work away.
+        assert!(concern("git", "commit -m restore").is_none());
+        assert!(concern("git", "commit -m 'clean up'").is_none());
+        // git's own options come before the verb.
+        assert!(concern("git", "-C /tmp restore file").is_some());
+        assert!(concern("git", "restore --staged file").is_none());
     }
 
     #[test]
