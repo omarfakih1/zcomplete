@@ -1,9 +1,4 @@
-//! Talking to the terminal from inside a command substitution.
-//!
-//! The shell hook captures our stdout, so anything the user is meant to read or
-//! answer goes straight to /dev/tty. If there is no controlling terminal — a
-//! script, a cron job, a CI runner — there is nobody to ask, and callers treat
-//! that as "no".
+//! The hook captures our stdout, so anything a human reads goes to /dev/tty.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -11,46 +6,34 @@ use std::os::unix::io::AsRawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
-use crate::config::Color;
-
 pub struct Tty {
     file: File,
     pub color: bool,
-    /// A shell's line editor owns the screen and is tracking where the cursor
-    /// is. Anything written has to be taken back before control returns, or the
-    /// editor redraws from a position that no longer exists.
     borrowed: bool,
     disturbed: bool,
 }
 
 impl Tty {
-    pub fn open(preference: Color) -> Option<Tty> {
-        Tty::open_as(preference, false)
+    pub fn open() -> Option<Tty> {
+        Tty::open_as(false)
     }
 
-    pub fn open_as(preference: Color, borrowed: bool) -> Option<Tty> {
-        // Opening /dev/tty fails with ENXIO when the process has no controlling
-        // terminal, which is exactly how we detect CI and cron. Checking
-        // isatty(0) would be wrong: stdin is a pipe in the case we care about.
+    pub fn open_as(borrowed: bool) -> Option<Tty> {
+        // Opening /dev/tty fails with ENXIO when there is no controlling terminal,
+        // which is how CI and cron are detected. isatty(0) would be wrong: stdin
+        // is a pipe in the case we care about.
         let file = File::options()
             .read(true)
             .write(true)
             .open("/dev/tty")
             .ok()?;
-        // A background job owns no terminal even though it can open one. Asking
-        // there stops the job on tty output and leaves the user looking at a
-        // [Y/n] they have no way to answer without fg.
+        // A background job can open a terminal but owns none: asking there stops
+        // the job and leaves a [Y/n] nobody can answer without fg.
         if unsafe { libc::tcgetpgrp(file.as_raw_fd()) } != unsafe { libc::getpgrp() } {
             return None;
         }
-        let color = match preference {
-            Color::Always => true,
-            Color::Never => false,
-            Color::Auto => {
-                std::env::var_os("NO_COLOR").is_none()
-                    && std::env::var("TERM").is_ok_and(|term| term != "dumb")
-            }
-        };
+        let color = std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("TERM").is_ok_and(|term| term != "dumb");
         Some(Tty {
             file,
             color,
@@ -61,15 +44,13 @@ impl Tty {
 
     pub fn say(&mut self, text: &str) {
         if self.borrowed && !self.disturbed {
-            // Ask the question on the alternate screen. The terminal restores
-            // the primary screen byte for byte on the way out, so the editor's
-            // idea of what is drawn and where the cursor sits both survive.
-            // Trying to patch the line up afterwards with save-and-restore does
-            // not work: the question moves the cursor to a row the editor never
-            // hears about, and its next redraw smears from there. This is what
-            // any full-screen fish binding does, fzf included.
-            let _ = self.file.write_all(b"\x1b[?1049h\x1b[H");
+            // Ask on the alternate screen, the way fzf does: the terminal restores the
+            // primary one byte for byte. Save-and-restore does not work, because the
+            // question moves the cursor to a row the editor never hears about.
+            // Published first: a signal landing between the two would otherwise
+            // leave the alternate screen up with nothing recorded to undo it.
             ALTERNATE.store(self.file.as_raw_fd(), Ordering::Release);
+            let _ = self.file.write_all(b"\x1b[?1049h\x1b[H");
             self.disturbed = true;
         }
         let _ = self.file.write_all(text.as_bytes());
@@ -84,8 +65,6 @@ impl Tty {
         }
     }
 
-    /// One keypress, no Enter. ISIG stays on, so Ctrl-C still raises SIGINT and
-    /// the guard below puts the terminal back before we die.
     fn key(&mut self) -> Option<char> {
         let _raw = Raw::enter(&self.file)?;
 
@@ -95,8 +74,7 @@ impl Tty {
             _ => return None,
         };
         if first == 0x1b {
-            // An arrow key is three bytes. Swallow the tail, or the shell reads
-            // "[A" as typing the moment we hand the terminal back.
+            // An arrow key is three bytes; the shell would read the tail as typing.
             Raw::poll_briefly(&self.file);
             let _ = self.file.read(&mut [0u8; 16]);
         }
@@ -110,21 +88,24 @@ impl Tty {
     }
 
     pub fn ask(&mut self, question: &str, default_yes: bool) -> bool {
+        self.ask_with(question, default_yes, &[]) == 'y'
+    }
+
+    pub fn ask_with(&mut self, question: &str, default_yes: bool, extra: &[char]) -> char {
         let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
         self.say(&format!("{question} {} ", self.paint("2", hint)));
 
         let answer = self.key().or_else(|| self.line());
-        let yes = match answer {
-            Some('y' | 'Y') => true,
-            Some('\r' | '\n') => default_yes,
-            _ => false,
+        let picked = match answer.map(|key| key.to_ascii_lowercase()) {
+            Some(key) if extra.contains(&key) => key,
+            Some('y') => 'y',
+            Some('\r' | '\n') if default_yes => 'y',
+            _ => 'n',
         };
-        self.say(if yes { "y\n" } else { "n\n" });
-        yes
+        self.say(&format!("{picked}\n"));
+        picked
     }
 
-    /// A numbered menu for when the top match is not clearly the right one.
-    /// Returns the chosen index, or `None` if the user backed out.
     pub fn choose(&mut self, header: &str, options: &[String]) -> Option<usize> {
         self.say(&format!("{header}\n"));
         for (i, option) in options.iter().enumerate() {
@@ -160,11 +141,20 @@ struct Saved {
     state: libc::termios,
 }
 
-/// Set by `Raw::enter` so a signal arriving mid-prompt can put the terminal
-/// back. Leaving somebody's shell in a non-echoing state is the worst failure
-/// this program could have — and leaving it on the alternate screen is second.
+/// So a signal mid-prompt can put the terminal back. Leaving a shell
+/// non-echoing is the worst failure this could have.
 static PENDING: AtomicPtr<Saved> = AtomicPtr::new(ptr::null_mut());
 static ALTERNATE: AtomicI32 = AtomicI32::new(-1);
+
+/// SIGABRT included: the release profile aborts on panic rather than
+/// unwinding, so `Raw::drop` is not what puts the terminal back.
+const RESCUED: [libc::c_int; 5] = [
+    libc::SIGINT,
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGABRT,
+];
 
 struct Raw;
 
@@ -184,12 +174,10 @@ impl Raw {
             drop(unsafe { Box::from_raw(saved) });
             return None;
         }
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+        for signal in RESCUED {
             unsafe { libc::signal(signal, rescue as *const () as libc::sighandler_t) };
         }
 
-        // Character at a time with no echo, but ISIG left alone so Ctrl-C keeps
-        // working the way the user expects at a prompt.
         let mut raw = state;
         raw.c_lflag &= !(libc::ICANON | libc::ECHO);
         raw.c_cc[libc::VMIN] = 1;
@@ -201,7 +189,6 @@ impl Raw {
         Some(Raw)
     }
 
-    /// Wait up to a tenth of a second for more bytes, then stop.
     fn poll_briefly(tty: &File) {
         let fd = tty.as_raw_fd();
         let mut state = unsafe { std::mem::zeroed::<libc::termios>() };
@@ -226,7 +213,7 @@ fn restore() {
     }
     let saved = unsafe { Box::from_raw(saved) };
     unsafe { libc::tcsetattr(saved.fd, libc::TCSANOW, &saved.state) };
-    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+    for signal in RESCUED {
         unsafe { libc::signal(signal, libc::SIG_DFL) };
     }
 }
@@ -239,8 +226,7 @@ extern "C" fn rescue(signal: libc::c_int) {
     }
     let saved = PENDING.swap(ptr::null_mut(), Ordering::AcqRel);
     if !saved.is_null() {
-        // Deliberately not freeing: the allocator is not safe to call from a
-        // signal handler, and this process is about to die anyway.
+        // Not freed: the allocator is not signal-safe and we are about to die.
         unsafe { libc::tcsetattr((*saved).fd, libc::TCSANOW, &(*saved).state) };
     }
     unsafe {

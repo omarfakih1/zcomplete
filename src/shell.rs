@@ -1,8 +1,11 @@
-//! PATH lookups, the init snippets, and reading a shell's history file.
+//! PATH, the init snippets, and history files. The only module that runs
+//! another program or reads a file it did not write.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::store::Shell;
 
@@ -14,50 +17,272 @@ pub fn init_script(shell: Shell) -> &'static str {
     }
 }
 
-/// Is `name` an executable on PATH right now. This is what keeps a word the
-/// user types often but that is not installed — `clean`, `deploy`, a typo they
-/// keep making — from ever becoming a suggestion.
+fn path_dirs() -> &'static [Vec<u8>] {
+    static DIRS: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    DIRS.get_or_init(|| {
+        let mut dirs: Vec<Vec<u8>> = Vec::new();
+        let Some(path) = std::env::var_os("PATH") else {
+            return dirs;
+        };
+        for dir in path.as_bytes().split(|byte| *byte == b':') {
+            // A repeated entry can never win over its first appearance, and
+            // scanning it again is the single most expensive thing here.
+            if !dir.is_empty() && !dirs.iter().any(|seen| seen == dir) {
+                dirs.push(dir.to_vec());
+            }
+        }
+        dirs
+    })
+}
+
 pub fn on_path(name: &str) -> bool {
-    if name.contains('/') {
+    if name.is_empty() || name.contains('/') {
         return false;
     }
-    let Some(path) = std::env::var_os("PATH") else {
+    let mut buf = [0u8; 1024];
+    path_dirs()
+        .iter()
+        .any(|dir| is_program(&mut buf, dir, name.as_bytes()))
+}
+
+fn is_program(buf: &mut [u8; 1024], dir: &[u8], name: &[u8]) -> bool {
+    // A C string ends at the first NUL, so `ls\0junk` would be stat'd as `ls`
+    // and reported installed. `fs::metadata`, which this replaced, refused it.
+    let end = dir.len() + 1 + name.len();
+    if end >= buf.len() || name.contains(&0) {
         return false;
-    };
-    std::env::split_paths(&path)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .any(|dir| executable(&dir.join(name)))
+    }
+    buf[..dir.len()].copy_from_slice(dir);
+    buf[dir.len()] = b'/';
+    buf[dir.len() + 1..end].copy_from_slice(name);
+    buf[end] = 0;
+
+    let mut info = unsafe { std::mem::zeroed::<libc::stat>() };
+    let found = unsafe { libc::stat(buf.as_ptr().cast(), &mut info) } == 0;
+    found && info.st_mode & libc::S_IFMT == libc::S_IFREG && info.st_mode & 0o111 != 0
 }
 
-fn executable(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-/// Every name on PATH, as a cold-start fallback for when nothing the user has
-/// actually run looks like what they typed. Deliberately does not stat each
-/// file — that is a syscall per entry across a few thousand of them, and the
-/// handful of names that survive ranking get checked by `on_path` anyway.
-pub fn path_commands() -> Vec<String> {
-    let Some(path) = std::env::var_os("PATH") else {
-        return Vec::new();
-    };
-    let mut seen = std::collections::HashSet::new();
-    std::env::split_paths(&path)
-        .filter_map(|dir| fs::read_dir(dir).ok())
-        .flatten()
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| seen.insert(name.clone()))
-        .collect()
+pub fn path_commands(wanted: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut path = [0u8; 1024];
+    for dir in path_dirs() {
+        if dir.len() >= path.len() {
+            continue;
+        }
+        path[..dir.len()].copy_from_slice(dir);
+        path[dir.len()] = 0;
+        let handle = unsafe { libc::opendir(path.as_ptr().cast()) };
+        if handle.is_null() {
+            continue;
+        }
+        loop {
+            let entry = unsafe { libc::readdir(handle) };
+            if entry.is_null() {
+                break;
+            }
+            // Through a raw pointer, never `&*entry`: a record is only `d_reclen`
+            // bytes, so a reference would claim bytes past the last one in a buffer.
+            let name =
+                unsafe { std::ffi::CStr::from_ptr(std::ptr::addr_of!((*entry).d_name).cast()) };
+            if let Ok(name) = name.to_str() {
+                if wanted(name) {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        unsafe { libc::closedir(handle) };
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 pub fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| executable(candidate))
+    let mut buf = [0u8; 1024];
+    path_dirs()
+        .iter()
+        .find(|dir| is_program(&mut buf, dir, name.as_bytes()))
+        .map(|dir| Path::new(std::ffi::OsStr::from_bytes(dir)).join(name))
 }
 
-/// A command line from a history file, and when it ran if the format says so.
+pub fn advertised_verbs(name: &str) -> Vec<String> {
+    let Some(text) = help_output(name) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = Vec::new();
+    for line in text.lines() {
+        for verb in verbs_in(line, name) {
+            if !found.iter().any(|seen| seen == &verb) {
+                found.push(verb);
+            }
+        }
+        if found.len() >= 400 {
+            break;
+        }
+    }
+    found
+}
+
+/// Four layouts cover essentially every tool:
+///
+///     git   "   clone      Clone a repository into a new directory"
+///     gh    "  auth:          Authenticate gh and git with GitHub"
+///     brew  "  brew install FORMULA|CASK..."
+///     npm   "    access, adduser, audit, bugs, cache, ci,"
+///
+/// All four need the line indented and the word bare, which keeps prose out.
+fn verbs_in(line: &str, parent: &str) -> Vec<String> {
+    let body = line.trim_end();
+    let text = body.trim_start();
+    let indent = body.len() - text.len();
+    if !(2..=8).contains(&indent) || text.is_empty() {
+        return Vec::new();
+    }
+    let mut words = text.split_whitespace();
+    let (Some(first), second) = (words.next(), words.next()) else {
+        return Vec::new();
+    };
+
+    if first == parent {
+        return second
+            .filter(|w| bare_word(w))
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+    }
+    if text.contains(',') {
+        let items: Vec<&str> = text
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if items.iter().all(|item| bare_word(item)) {
+            return items.into_iter().map(str::to_owned).collect();
+        }
+    }
+    let word = first.strip_suffix(':').unwrap_or(first);
+    if text[first.len()..].starts_with("  ") && bare_word(word) {
+        return vec![word.to_owned()];
+    }
+    Vec::new()
+}
+
+fn bare_word(word: &str) -> bool {
+    (2..=21).contains(&word.len())
+        && word.starts_with(|c: char| c.is_ascii_lowercase())
+        && word
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Runs something and gives up on it. `keep_errors` merges the two streams
+/// through one file offset, for tools that split their help across both.
+fn capture(
+    program: &Path,
+    args: &[&str],
+    keep_errors: bool,
+    patience: std::time::Duration,
+) -> Option<String> {
+    use std::process::{Command, Stdio};
+
+    // Beside the database, not in /tmp: the pid is guessable, and `File::create`
+    // on a symlink someone else planted there writes through it.
+    let sink = crate::store::db_path().with_file_name(format!("out.{}", std::process::id()));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(sink.parent()?)
+        .ok()?;
+    // A crash leaves one behind, and pids come round again.
+    let _ = fs::remove_file(&sink);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&sink)
+        .ok()?;
+    let errors = match keep_errors {
+        true => Stdio::from(file.try_clone().ok()?),
+        false => Stdio::null(),
+    };
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(file)
+        .stderr(errors)
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + patience;
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Err(_) => break false,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    };
+
+    let text = finished
+        .then(|| fs::read(&sink).ok())
+        .flatten()
+        .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(256 * 1024)]).into_owned());
+    let _ = fs::remove_file(&sink);
+    text
+}
+
+fn help_output(name: &str) -> Option<String> {
+    let path = which(name)?;
+    capture(
+        &path,
+        &["--help"],
+        true,
+        std::time::Duration::from_millis(500),
+    )
+}
+
+/// The aliases, functions and builtins the shell has right now. History alone
+/// cannot see them: `gs` is not on PATH, so an import drops it, and the word
+/// you type twenty times a day never enters the database.
+///
+/// Interactive, because that is the only kind of shell that reads the file your
+/// aliases live in. Errors are dropped: an interactive bash with no terminal
+/// complains about job control before it does anything useful.
+pub fn defined_words(shell: Shell) -> Vec<String> {
+    let script = match shell {
+        Shell::Zsh => "print -rl -- ${(k)aliases} ${(k)functions} ${(k)builtins}",
+        Shell::Bash => "compgen -a; compgen -A function; compgen -b",
+        // A fish alias is a function, and `functions -n` is one comma-separated line.
+        Shell::Fish => "functions -n | string split ', '; builtin -n",
+    };
+    // fish reads its config for `-c` as well, and its `-i` wants a terminal.
+    let mode = match shell {
+        Shell::Fish => "-c",
+        _ => "-ic",
+    };
+    let Some(path) = which(shell.name()) else {
+        return Vec::new();
+    };
+    capture(
+        &path,
+        &[mode, script],
+        false,
+        std::time::Duration::from_secs(5),
+    )
+    .map(|text| {
+        text.lines()
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 pub struct Recalled {
     pub line: String,
     pub at: Option<u64>,
@@ -73,17 +298,15 @@ pub fn history_path(shell: Shell) -> Option<PathBuf> {
     let path = match shell {
         Shell::Zsh => from_env("HISTFILE").unwrap_or_else(|| home.join(".zsh_history")),
         Shell::Bash => from_env("HISTFILE").unwrap_or_else(|| home.join(".bash_history")),
-        Shell::Fish => match std::env::var_os("XDG_DATA_HOME") {
-            Some(data) if !data.is_empty() => PathBuf::from(data).join("fish/fish_history"),
-            _ => home.join(".local/share/fish/fish_history"),
+        Shell::Fish => match from_env("XDG_DATA_HOME") {
+            Some(data) => data.join("fish/fish_history"),
+            None => home.join(".local/share/fish/fish_history"),
         },
     };
     path.exists().then_some(path)
 }
 
 pub fn read_history(shell: Shell, path: &Path) -> std::io::Result<Vec<Recalled>> {
-    // History files collect whatever the terminal was fed, including bytes that
-    // are not UTF-8. Read lossily rather than refusing to import at all.
     let text = String::from_utf8_lossy(&fs::read(path)?).into_owned();
     Ok(match shell {
         Shell::Zsh => zsh_history(&text),
@@ -92,8 +315,6 @@ pub fn read_history(shell: Shell, path: &Path) -> std::io::Result<Vec<Recalled>>
     })
 }
 
-/// Extended format is `: <unix time>:<elapsed>;<command>`; plain format is the
-/// command on its own. A trailing backslash continues onto the next line.
 fn zsh_history(text: &str) -> Vec<Recalled> {
     let mut out = Vec::new();
     let mut pending: Option<String> = None;
@@ -111,15 +332,12 @@ fn zsh_history(text: &str) -> Vec<Recalled> {
             continue;
         }
 
-        let (at, line) = match joined.strip_prefix(": ") {
-            Some(rest) => match rest.split_once(';') {
-                Some((meta, command)) => (
-                    meta.split(':').next().and_then(|t| t.trim().parse().ok()),
-                    command.to_owned(),
-                ),
-                None => (None, joined.clone()),
-            },
-            None => (None, joined.clone()),
+        let (at, line) = match joined.strip_prefix(": ").and_then(|r| r.split_once(';')) {
+            Some((meta, command)) => (
+                meta.split(':').next().and_then(|t| t.trim().parse().ok()),
+                command.to_owned(),
+            ),
+            None => (None, joined),
         };
         if !line.trim().is_empty() {
             out.push(Recalled { line, at });
@@ -132,11 +350,9 @@ fn bash_history(text: &str) -> Vec<Recalled> {
     let mut out = Vec::new();
     let mut stamp = None;
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix('#') {
-            if let Ok(seconds) = rest.trim().parse::<u64>() {
-                stamp = Some(seconds);
-                continue;
-            }
+        if let Some(seconds) = line.strip_prefix('#').and_then(|r| r.trim().parse().ok()) {
+            stamp = Some(seconds);
+            continue;
         }
         if !line.trim().is_empty() {
             out.push(Recalled {
@@ -148,7 +364,6 @@ fn bash_history(text: &str) -> Vec<Recalled> {
     out
 }
 
-/// fish writes a YAML-ish stream: `- cmd: git status` followed by `  when: …`.
 fn fish_history(text: &str) -> Vec<Recalled> {
     let mut out: Vec<Recalled> = Vec::new();
     for line in text.lines() {
@@ -188,28 +403,16 @@ fn unescape_fish(value: &str) -> String {
     out
 }
 
-/// The command word a history line actually invoked, skipping the wrappers and
-/// environment assignments that come first.
+pub const WRAPPERS: &[&str] = &[
+    "sudo", "doas", "command", "builtin", "nohup", "exec", "env", "time", "nice", "stdbuf",
+];
+
 pub fn command_word(line: &str) -> Option<&str> {
     let mut rest = line.trim_start();
     loop {
         let word = rest.split_whitespace().next()?;
-        let wrapper = matches!(
-            word,
-            "sudo"
-                | "doas"
-                | "command"
-                | "builtin"
-                | "nohup"
-                | "exec"
-                | "env"
-                | "time"
-                | "nice"
-                | "stdbuf"
-        );
-        if !wrapper && !word.contains('=') {
-            return (!word.is_empty()
-                && !word.contains('/')
+        if !WRAPPERS.contains(&word) && !word.contains('=') {
+            return (!word.contains('/')
                 && !word.starts_with(['#', '-', '$', '(', '"', '\'', '!']))
             .then_some(word);
         }
@@ -220,7 +423,6 @@ pub fn command_word(line: &str) -> Option<&str> {
     }
 }
 
-/// Where a shell reads its startup files, for `doctor` and the installer.
 pub fn rc_files(shell: Shell) -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
@@ -237,30 +439,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_extended_and_plain_zsh_history() {
-        let entries =
-            zsh_history(": 1700000000:0;git status\nls -la\n: 1700000005:12;make \\\nall\n");
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].line, "git status");
-        assert_eq!(entries[0].at, Some(1_700_000_000));
-        assert_eq!(entries[1].at, None);
-        assert_eq!(entries[2].line, "make all");
-    }
+    fn reads_every_history_format() {
+        let zsh = zsh_history(": 1700000000:0;git status\nls -la\n: 1700000005:12;make \\\nall\n");
+        assert_eq!(zsh.len(), 3);
+        assert_eq!(zsh[0].line, "git status");
+        assert_eq!(zsh[0].at, Some(1_700_000_000));
+        assert_eq!(zsh[1].at, None);
+        assert_eq!(zsh[2].line, "make all");
 
-    #[test]
-    fn reads_timestamped_bash_history() {
-        let entries = bash_history("#1700000000\ngit push\ncargo test\n");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].at, Some(1_700_000_000));
-        assert_eq!(entries[1].at, None);
-    }
+        let bash = bash_history("#1700000000\ngit push\ncargo test\n");
+        assert_eq!(bash.len(), 2);
+        assert_eq!(bash[0].at, Some(1_700_000_000));
+        assert_eq!(bash[1].at, None);
 
-    #[test]
-    fn reads_fish_history() {
-        let entries = fish_history("- cmd: echo hi\\nthere\n  when: 1700000000\n- cmd: ls\n");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].line, "echo hi\nthere");
-        assert_eq!(entries[0].at, Some(1_700_000_000));
+        let fish = fish_history("- cmd: echo hi\\nthere\n  when: 1700000000\n- cmd: ls\n");
+        assert_eq!(fish.len(), 2);
+        assert_eq!(fish[0].line, "echo hi\nthere");
+        assert_eq!(fish[0].at, Some(1_700_000_000));
     }
 
     #[test]
@@ -269,10 +464,6 @@ mod tests {
         assert_eq!(command_word("FOO=1 BAR=2 make -j8"), Some("make"));
         assert_eq!(command_word("env RUST_LOG=debug cargo run"), Some("cargo"));
         assert_eq!(command_word("  ls"), Some("ls"));
-    }
-
-    #[test]
-    fn skips_lines_that_are_not_commands() {
         assert_eq!(command_word("./configure"), None);
         assert_eq!(command_word("/usr/bin/env python"), None);
         assert_eq!(command_word("# a comment"), None);
@@ -281,9 +472,41 @@ mod tests {
     }
 
     #[test]
+    fn help_output_yields_verbs_and_not_prose() {
+        let verbs = |line: &str, parent: &str| verbs_in(line, parent);
+
+        assert_eq!(verbs("   clone      Clone a repository", "git"), ["clone"]);
+        assert_eq!(verbs("  auth:          Authenticate gh", "gh"), ["auth"]);
+        assert_eq!(verbs("  brew install FORMULA|CASK...", "brew"), ["install"]);
+        assert_eq!(
+            verbs("    access, adduser, audit,", "npm"),
+            ["access", "adduser", "audit"]
+        );
+
+        assert!(verbs("These are common Git commands:", "git").is_empty());
+        assert!(verbs("  the quick brown fox", "git").is_empty());
+        assert!(verbs("  -v, --verbose    Use verbose output", "cargo").is_empty());
+        assert!(verbs("      --list       List installed commands", "cargo").is_empty());
+        assert!(verbs("  possible values: auto, always, never", "cargo").is_empty());
+        assert!(verbs("  usage: cat [-belnstuv] [file ...]", "cat").is_empty());
+    }
+
+    #[test]
+    fn a_real_command_advertises_its_real_verbs() {
+        let found = advertised_verbs("git");
+        assert!(found.contains(&"status".to_string()), "{found:?}");
+        assert!(found.contains(&"commit".to_string()), "{found:?}");
+        assert!(advertised_verbs("cat").len() < 2);
+    }
+
+    #[test]
     fn path_lookup_agrees_with_the_system() {
         assert!(on_path("sh"));
         assert!(!on_path("definitely-not-a-real-binary-xyzzy"));
         assert!(!on_path("/bin/sh"));
+        assert!(!on_path("."));
+        assert!(!on_path("sh\0junk"));
+        assert!(which("sh\0junk").is_none());
+        assert!(which("sh").is_some_and(|p| p.ends_with("sh")));
     }
 }

@@ -1,14 +1,6 @@
-# zcomplete — bash integration.
-# Loaded by:  eval "$(zcomplete init bash)"
-#
-# Interception needs bash 4.0 or newer, which is where command_not_found_handle
-# arrived. On the bash 3.2 that ships with macOS the recording half still works,
-# so a newer bash started later already knows your habits; `zcomplete doctor`
-# says so out loud.
-#
-# Sourcing this twice is harmless; nothing here uses `return`, which inside an
-# `eval` would abandon the rest of your .bashrc.
-
+# zcomplete: bash integration, loaded by  eval "$(zcomplete init bash)"
+# Interception needs bash 4.0. On the 3.2 macOS ships, the recording half
+# still works and the fix is offered at the next prompt instead.
 if declare -F command_not_found_handle >/dev/null 2>&1 &&
     ! declare -F __zcomplete_previous >/dev/null 2>&1; then
     case "$(declare -f command_not_found_handle)" in
@@ -17,8 +9,6 @@ if declare -F command_not_found_handle >/dev/null 2>&1 &&
     esac
 fi
 
-# Builtins, matched without forking a `type -t`. Anything else is settled by
-# zcomplete, which will not record a word that is not on PATH.
 __zcomplete_is_builtin() {
     case "$1" in
         .|:|alias|bg|bind|break|builtin|caller|cd|command|compgen|complete|compopt|continue|declare|dirs|disown|echo|enable|eval|exec|exit|export|false|fc|fg|getopts|hash|help|history|jobs|kill|let|local|logout|mapfile|popd|printf|pushd|pwd|read|readarray|readonly|return|set|shift|shopt|source|suspend|test|times|trap|true|type|typeset|ulimit|umask|unalias|unset|wait) return 0 ;;
@@ -30,8 +20,8 @@ __zcomplete_record() {
     local __zc_exit=$?
     local entry number line typed word kind fixed
 
-    # `history 1` gives "  512  git status"; peel off the event number and use
-    # it to avoid recording the same line twice when the prompt redraws.
+    # `history 1` gives "  512  git status". The event number is what stops a
+    # prompt redraw from recording the same line twice.
     entry=$(HISTTIMEFORMAT='' history 1) || return $__zc_exit
     entry=${entry#"${entry%%[![:space:]]*}"}
     number=${entry%%[![:digit:]]*}
@@ -44,8 +34,6 @@ __zcomplete_record() {
     typed=$line
 
     while :; do
-        # Word splitting is what we want here: the first field is the command.
-        # shellcheck disable=SC2086
         set -- $line
         word=${1:-}
         case "$word" in
@@ -62,18 +50,21 @@ __zcomplete_record() {
         ''|*/*) return $__zc_exit ;;
     esac
 
-    # bash 3.2 has no command_not_found_handle, so the correction has to happen
-    # after the fact: the line already failed with 127 and we offer to run it
-    # properly. This half runs in the real shell, not a fork, so a `cd` in the
-    # rewritten line sticks.
-    if [ "${BASH_VERSINFO[0]}" -lt 4 ] && [ "$__zc_exit" -eq 127 ] &&
+    # Two ways to arrive here with the line still unrun: bash 3.2 has no
+    # interception at all, and on bash 4 the handler hands back an alias or a
+    # function rather than running it in a fork that cannot keep what it does.
+    # Either way this is the real shell, so a `cd` in the rewritten line sticks.
+    if { [ "$__zc_exit" -eq 5 ] ||
+        { [ "${BASH_VERSINFO[0]}" -lt 4 ] && [ "$__zc_exit" -eq 127 ]; }; } &&
         ! type "$word" >/dev/null 2>&1; then
         fixed=$(command zcomplete retry --shell bash --only "$word" -- "$typed")
         if [ $? -eq 0 ] && [ -n "$fixed" ]; then
             eval "$fixed"
             return $?
         fi
-        return $__zc_exit
+        # Nothing was printed when the handler stepped aside.
+        [ "$__zc_exit" -eq 5 ] && printf '%s: command not found\n' "$word" >&2
+        return 127
     fi
 
     if declare -F "$word" >/dev/null 2>&1 || alias "$word" >/dev/null 2>&1 ||
@@ -83,28 +74,33 @@ __zcomplete_record() {
         kind=auto
     fi
 
-    command zcomplete record --shell bash --kind "$kind" -- "$word"
+    fixed=$(command zcomplete record --shell bash --kind "$kind" --status "$__zc_exit" -- "$typed")
+    if [ -n "$fixed" ]; then
+        eval "$fixed"
+        return $?
+    fi
     return $__zc_exit
 }
 
 command_not_found_handle() {
-    # bash runs this in a forked child (verified: BASHPID differs from $$), so
-    # dropping the handler here is child-local and stops a missing zcomplete
-    # binary from recursing on every unknown word.
+    # Child-local: bash runs this in a forked child, so dropping the handler
+    # stops a missing zcomplete binary recursing on every unknown word.
     unset -f command_not_found_handle
 
-    local word=$1 target ret
+    local word=$1 reply target second ret
     case $- in
         *i*)
-            target=$(command zcomplete resolve --shell bash -- "$@")
+            reply=$(command zcomplete resolve --shell bash --subshell -- "$@")
             ret=$?
+            target=${reply%%$'\n'*}
+            case $reply in *$'\n'*) second=${reply#*$'\n'} ;; *) second= ;; esac
             ;;
         *) ret=1 ;;
     esac
 
-    # The store can name a function from a .bashrc that no longer defines it.
     if [ $ret -eq 0 ] && [ -n "$target" ] && type "$target" >/dev/null 2>&1; then
         shift
+        case $second in 'verb '*) set -- "${second#verb }" "${@:2}" ;; esac
         if alias "$target" >/dev/null 2>&1; then
             eval -- "$(printf '%q ' "$target" "$@")"
         else
@@ -112,7 +108,8 @@ command_not_found_handle() {
         fi
         return $?
     fi
-    # 130 is a Ctrl-C at the prompt; the user has already said enough.
+    # Left for the next prompt, which is the shell and not a fork of it.
+    [ $ret -eq 5 ] && return 5
     [ $ret -eq 130 ] && return 130
 
     if declare -F __zcomplete_previous >/dev/null 2>&1; then
@@ -128,7 +125,6 @@ case "${PROMPT_COMMAND:-}" in
     *) PROMPT_COMMAND="__zcomplete_record${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
 esac
 
-complete -W 'init query stats import forget bind unbind ignore mode on off doctor export help --safe --unsafe --bypass --version' zcomplete
+complete -W 'init query stats import forget bind unbind ignore mode safe unsafe bypass on off doctor help --version' zcomplete
 
-# Sourcing us should not hand .bashrc a non-zero status.
 true

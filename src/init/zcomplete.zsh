@@ -1,12 +1,8 @@
-# zcomplete — zsh integration.
-# Loaded by:  eval "$(zcomplete init zsh)"
-#
-# Sourcing this twice is harmless; nothing here uses `return`, which inside an
-# `eval` would abandon the rest of your .zshrc.
+# zcomplete: zsh integration, loaded by  eval "$(zcomplete init zsh)"
+# Nothing here uses `return`, which inside an `eval` would abandon the rest
+# of your .zshrc. Sourcing twice is harmless.
 
-# Keep any handler that was already installed (Homebrew's, a distro's) so a word
-# zcomplete cannot place still reaches whoever asked for it. Guarded so a second
-# load does not capture our own handler and recurse forever.
+# Keep a handler already installed, guarded against capturing our own.
 if (( $+functions[command_not_found_handler] )) && (( ! $+functions[__zcomplete_previous] )); then
     if [[ $functions[command_not_found_handler] != *zcomplete* ]]; then
         functions[__zcomplete_previous]=$functions[command_not_found_handler]
@@ -25,48 +21,71 @@ __zcomplete_first_word() {
     REPLY=${words[1]:-}
 }
 
-__zcomplete_record() {
-    emulate -L zsh
-    local REPLY kind
-    __zcomplete_first_word "$1"
-    [[ -n $REPLY && $REPLY != */* ]] || return 0
+__zcomplete_preexec() {
+    __zcomplete_typed=$1
+}
 
-    # Subscripts inside (( )) are evaluated as arithmetic, so $+commands[git-lfs]
-    # asks about a key named "git minus lfs" and quietly answers no. Every
-    # hyphenated command and every alias went unlearned that way.
+# After the command, not before: the exit status is half the lesson, and
+# `git sttaus` must never teach us that git has a `sttaus`.
+__zcomplete_precmd() {
+    local ret=$?
+    emulate -L zsh
+    local line=$__zcomplete_typed
+    __zcomplete_typed=
+    [[ -n $line ]] || return $ret
+
+    local REPLY kind fixed
+    __zcomplete_first_word "$line"
+    [[ -n $REPLY && $REPLY != */* ]] || return $ret
+
+    # The not-found hook ran in a fork, found an alias or a function there, and
+    # handed it back rather than running it: a fork is exactly what cannot keep
+    # what those do. Here we are the shell itself, so a `cd` in one sticks.
+    if (( ret == 5 )); then
+        fixed=$(\command zcomplete retry --shell zsh --only "$REPLY" -- "$line")
+        if [[ -n $fixed ]]; then
+            eval -- "$fixed"
+            return $?
+        fi
+        print -ru2 -- "zsh: command not found: $REPLY"
+        return 127
+    fi
+
+    # Not (( $+commands[...] )): subscripts there are arithmetic, so `git-lfs`
+    # asks about "git minus lfs" and quietly answers no.
     if [[ -n ${aliases[$REPLY]+x}${functions[$REPLY]+x}${builtins[$REPLY]+x} ]]; then
         kind=shell
     else
-        # $commands is a hash zsh fills at startup, so a tool installed since
-        # then is missing from it. Hand the word over and let zcomplete look at
-        # PATH itself; it refuses to record anything it cannot find.
         kind=auto
     fi
 
-    \command zcomplete record --shell zsh --kind $kind -- $REPLY
+    fixed=$(\command zcomplete record --shell zsh --kind $kind --status $ret -- "$line")
+    if [[ -n $fixed ]]; then
+        eval -- "$fixed"
+        return $?
+    fi
+    return $ret
 }
 
 command_not_found_handler() {
     emulate -L zsh
-    # zsh runs this in the fork it made to exec the missing command, so removing
-    # ourselves here is child-local. Without it, a zcomplete that has been
-    # uninstalled while this snippet is still in .zshrc recurses until zsh gives
-    # up on FUNCNEST.
+    # Child-local: zsh runs this in the fork it made to exec the missing
+    # command. Without it, an uninstalled zcomplete recurses until FUNCNEST.
     unfunction command_not_found_handler
 
     local word=$1 target ret
+    local -a reply
     if [[ -o interactive ]]; then
-        target=$(\command zcomplete resolve --shell zsh -- "$@")
+        reply=(${(f)"$(\command zcomplete resolve --shell zsh --subshell -- "$@")"})
         ret=$?
+        target=${reply[1]:-}
     else
         ret=1
     fi
 
-    # The store can name a function from a .zshrc that no longer defines it.
-    # `whence` searches for real, unlike the $commands hash, which zsh fills at
-    # startup and which therefore misses anything installed since.
     if (( ret == 0 )) && [[ -n $target ]] && whence -- "$target" >/dev/null 2>&1; then
         shift
+        [[ ${reply[2]:-} == verb\ * ]] && set -- "${reply[2]#verb }" "${@:2}"
         if [[ -n ${aliases[$target]+x} ]]; then
             eval -- ${(q)target} ${(q)@}
         else
@@ -74,7 +93,9 @@ command_not_found_handler() {
         fi
         return $?
     fi
-    # 130 is a Ctrl-C at the prompt; the user has already said enough.
+    # Left for precmd, which is the shell and not a fork of it. Silent, because
+    # the correction has not been offered yet.
+    (( ret == 5 )) && return 5
     (( ret == 130 )) && return 130
 
     if (( $+functions[__zcomplete_previous] )); then
@@ -86,28 +107,31 @@ command_not_found_handler() {
 }
 
 autoload -Uz add-zsh-hook
-add-zsh-hook preexec __zcomplete_record
+add-zsh-hook preexec __zcomplete_preexec
+add-zsh-hook precmd __zcomplete_precmd
 
 _zcomplete() {
     local -a subcommands
     subcommands=(
         'init:print shell integration'
         'query:show what a word would resolve to'
-        'stats:list learned commands by score'
+        'stats:list learned commands, or one command'"'"'s subcommands'
         'import:seed the database from shell history'
         'forget:drop a command'
         'bind:pin a shortcut to a command'
         'unbind:remove a pinned shortcut'
         'ignore:never suggest a command'
-        'mode:show or set the confirmation mode'
+        'mode:show the confirmation mode'
+        'safe:confirm every correction'
+        'unsafe:confirm only dangerous corrections'
+        'bypass:never confirm'
         'on:enable corrections'
         'off:disable corrections'
         'doctor:check the installation'
-        'export:dump the database as text'
     )
     if (( CURRENT == 2 )); then
         _describe 'command' subcommands
-        _values 'flag' '--safe' '--unsafe' '--bypass' '--version' '--help'
+        _values 'flag' '--version' '--help'
     else
         _default
     fi
@@ -116,7 +140,6 @@ if (( $+functions[compdef] )); then
     compdef _zcomplete zcomplete 2>/dev/null
 fi
 
-# compdef can be an autoload stub that compinit has not filled in yet, and a
-# failed completion registration is not a reason for `eval "$(zcomplete init
-# zsh)"` to hand your .zshrc a non-zero status.
+# compdef can be an autoload stub compinit has not filled in yet, and a failed
+# registration must not hand your .zshrc a non-zero status.
 true

@@ -1,38 +1,41 @@
-//! On-disk command store: frecency ranks, per-directory ranks, learned bindings.
-//!
-//! The file is rewritten whole on every save. That is fine at the sizes involved
-//! (a busy shell knows a few hundred commands, not a few hundred thousand) and it
-//! keeps writes atomic via rename.
+//! The on-disk store, rewritten whole on every save.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: [u8; 4] = *b"ZCDB";
-const FORMAT: u32 = 1;
+/// Anything appended after the last table decodes by omission, so an older
+/// file still reads. 2 added the settings trailer.
+const FORMAT: u32 = 2;
 
 const HOUR: u64 = 3_600;
 const DAY: u64 = 24 * HOUR;
 const WEEK: u64 = 7 * DAY;
 
-/// Once the ranks add up to this, everything is scaled down so the store cannot
-/// grow without bound and old habits eventually fade out of it.
 const AGE_CEILING: f32 = 4_000.0;
 const AGE_FACTOR: f32 = 0.92;
 const AGE_FLOOR: f32 = 0.6;
 
-const MAX_DIR_ENTRIES: usize = 4_096;
+const MAX_SCOPED: usize = 4_096;
 const MAX_BINDINGS: usize = 512;
 
-/// A binding weight this large was set by hand and is never decayed away.
 pub const PINNED: i32 = 1 << 20;
-/// Accepting the same correction this many times makes it authoritative.
 pub const STICKY_AT: i32 = 3;
-/// Rejecting a correction this many times retires it for good.
 pub const BURIED_AT: i32 = -2;
+
+/// A live success is 1.0 and a history sighting 0.5: `git status` clears this,
+/// the `foo` in `grep foo x.c` never does.
+pub const VERB_CONFIDENCE: f32 = 2.0;
+pub const VERBS_TO_QUALIFY: usize = 2;
+
+/// `is_verb` forbids NUL, so bookkeeping rows cannot collide with a real word.
+const MARKER: char = '\0';
+const ASKED: &str = "\0asked";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Shell {
@@ -62,10 +65,7 @@ impl Shell {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
-    /// An executable found on PATH.
     External,
-    /// A function, alias or builtin, and the shell it belongs to. A bash
-    /// function is not a candidate when the user is sitting in fish.
     Shell(Shell),
 }
 
@@ -90,9 +90,8 @@ impl Kind {
 
     pub fn usable_in(self, shell: Option<Shell>) -> bool {
         match (self, shell) {
-            (Kind::External, _) => true,
             (Kind::Shell(owner), Some(here)) => owner == here,
-            (Kind::Shell(_), None) => true,
+            _ => true,
         }
     }
 }
@@ -113,15 +112,79 @@ pub struct Binding {
     pub last: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Mode {
+    #[default]
+    Safe,
+    Unsafe,
+    Bypass,
+}
+
+impl Mode {
+    pub fn parse(name: &str) -> Option<Mode> {
+        match name.trim_start_matches('-') {
+            "safe" => Some(Mode::Safe),
+            "unsafe" => Some(Mode::Unsafe),
+            "bypass" => Some(Mode::Bypass),
+            _ => None,
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Mode::Safe => "confirm every correction",
+            Mode::Unsafe => "confirm only dangerous corrections",
+            Mode::Bypass => "never confirm",
+        }
+    }
+
+    fn tag(self) -> u8 {
+        self as u8
+    }
+
+    fn from_tag(tag: u8) -> Option<Mode> {
+        [Mode::Safe, Mode::Unsafe, Mode::Bypass]
+            .get(tag as usize)
+            .copied()
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Mode::Safe => "safe",
+            Mode::Unsafe => "unsafe",
+            Mode::Bypass => "bypass",
+        })
+    }
+}
+
+type Ranks = HashMap<String, (f32, u64)>;
+
 pub struct Store {
     pub entries: Vec<Entry>,
-    /// (directory hash, command) -> rank in that directory.
-    dirs: HashMap<(u64, String), (f32, u64)>,
+    scoped: HashMap<u64, Ranks>,
     pub bindings: Vec<Binding>,
     pub ignored: Vec<String>,
+    mode: Mode,
+    enabled: bool,
     dirty: bool,
     read_only: bool,
+}
+
+impl Default for Store {
+    fn default() -> Store {
+        Store {
+            entries: Vec::new(),
+            scoped: HashMap::new(),
+            bindings: Vec::new(),
+            ignored: Vec::new(),
+            mode: Mode::default(),
+            enabled: true,
+            dirty: false,
+            read_only: false,
+        }
+    }
 }
 
 enum Broken {
@@ -129,14 +192,28 @@ enum Broken {
     TooNew,
 }
 
+pub fn data_dir() -> PathBuf {
+    match std::env::var_os("ZCOMPLETE_DATA_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => match std::env::var_os("XDG_DATA_HOME") {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()))
+                .join(".local/share"),
+        }
+        .join("zcomplete"),
+    }
+}
+
+pub fn db_path() -> PathBuf {
+    data_dir().join("commands.bin")
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
-/// zoxide's decay curve. Recency dominates for a day, then frequency takes over.
 pub fn frecency(rank: f32, last: u64, now: u64) -> f32 {
     match now.saturating_sub(last) {
         d if d < HOUR => rank * 4.0,
@@ -146,20 +223,27 @@ pub fn frecency(rank: f32, last: u64, now: u64) -> f32 {
     }
 }
 
-pub fn dir_key(path: &Path) -> u64 {
-    use std::os::unix::ffi::OsStrExt;
+fn fnv(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in path.as_os_str().as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
     hash
 }
 
-/// A store held open for modification, with the file lock kept for the whole
-/// read-modify-write. Two shells running commands at the same moment would
-/// otherwise each load the same file and the second save would drop the first
-/// one's counts.
+pub fn dir_key(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    fnv(path.as_os_str().as_bytes())
+}
+
+pub fn sub_scope(parent: &str) -> u64 {
+    let mut key = Vec::with_capacity(parent.len() + 1);
+    key.push(0);
+    key.extend_from_slice(parent.as_bytes());
+    fnv(&key)
+}
+
 pub struct Editing {
     path: PathBuf,
     store: Store,
@@ -176,10 +260,10 @@ pub fn edit(path: &Path) -> Editing {
 }
 
 impl Editing {
-    pub fn commit(mut self) -> io::Result<()> {
+    pub fn commit(mut self) -> io::Result<Store> {
         let result = self.store.write(&self.path);
         self.lock = None;
-        result
+        result.map(|()| self.store)
     }
 }
 
@@ -199,21 +283,17 @@ impl std::ops::DerefMut for Editing {
 
 impl Store {
     pub fn open(path: &Path) -> Store {
-        let bytes = match fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(_) => return Store::default(),
+        let Ok(bytes) = fs::read(path) else {
+            return Store::default();
         };
         match decode(&bytes) {
             Ok(store) => store,
             Err(Broken::Garbled) => {
-                // Never let a damaged file wedge the shell: keep it for forensics
-                // and carry on from empty.
                 let _ = fs::rename(path, path.with_extension("corrupt"));
                 Store::default()
             }
+            // A newer zcomplete wrote this; do not overwrite what we cannot read.
             Err(Broken::TooNew) => Store {
-                // A newer zcomplete wrote this. Run without it rather than
-                // overwriting something we cannot read.
                 read_only: true,
                 ..Store::default()
             },
@@ -224,6 +304,28 @@ impl Store {
         self.read_only
     }
 
+    pub fn mode(&self) -> Mode {
+        std::env::var("ZCOMPLETE_MODE")
+            .ok()
+            .as_deref()
+            .and_then(Mode::parse)
+            .unwrap_or(self.mode)
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled && std::env::var_os("ZCOMPLETE_DISABLE").is_none()
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.dirty = true;
+    }
+
+    pub fn set_enabled(&mut self, on: bool) {
+        self.enabled = on;
+        self.dirty = true;
+    }
+
     pub fn get(&self, name: &str) -> Option<&Entry> {
         self.entries.iter().find(|e| e.name == name)
     }
@@ -232,80 +334,128 @@ impl Store {
         self.ignored.iter().any(|n| n == name)
     }
 
-    pub fn bump(&mut self, name: &str, kind: Kind, by: f32) {
-        let at = now();
+    fn slot(&mut self, name: &str, kind: Kind, by: f32, at: u64) -> &mut Entry {
         self.dirty = true;
-        match self.entries.iter_mut().find(|e| e.name == name) {
-            Some(entry) => {
+        match self.entries.iter().position(|e| e.name == name) {
+            Some(found) => {
+                let entry = &mut self.entries[found];
                 entry.rank += by;
-                entry.last = at;
-                entry.kind = kind;
+                entry.last = entry.last.max(at);
+                entry
             }
-            None => self.entries.push(Entry {
-                name: name.to_owned(),
-                kind,
-                rank: by,
-                last: at,
-            }),
+            None => {
+                self.entries.push(Entry {
+                    name: name.to_owned(),
+                    kind,
+                    rank: by,
+                    last: at,
+                });
+                self.entries.last_mut().expect("just pushed")
+            }
         }
+    }
+
+    pub fn bump(&mut self, name: &str, kind: Kind, by: f32) {
+        self.slot(name, kind, by, now()).kind = kind;
         self.age();
     }
 
-    /// Insert history without pretending it just happened. Imported commands
-    /// carry the timestamp they actually ran at, so a year-old habit does not
-    /// arrive looking like this morning's.
     pub fn seed(&mut self, name: &str, kind: Kind, by: f32, at: u64) {
-        self.dirty = true;
-        match self.entries.iter_mut().find(|e| e.name == name) {
-            Some(entry) => {
-                entry.rank += by;
-                entry.last = entry.last.max(at);
-            }
-            None => self.entries.push(Entry {
-                name: name.to_owned(),
-                kind,
-                rank: by,
-                last: at,
-            }),
-        }
+        self.slot(name, kind, by, at);
     }
 
     pub fn compact(&mut self) {
         self.age();
     }
 
-    pub fn bump_in(&mut self, dir: u64, name: &str, by: f32) {
+    pub fn bump_in(&mut self, scope: u64, name: &str, by: f32) {
         let at = now();
         self.dirty = true;
-        let slot = self.dirs.entry((dir, name.to_owned())).or_insert((0.0, at));
+        let slot = self
+            .scoped
+            .entry(scope)
+            .or_default()
+            .entry(name.to_owned())
+            .or_insert((0.0, at));
         slot.0 += by;
         slot.1 = at;
-        if self.dirs.len() > MAX_DIR_ENTRIES {
-            self.evict_dirs();
+        if self.scoped_len() > MAX_SCOPED {
+            self.evict_scoped();
         }
     }
 
-    /// Rank of `name` in `dir` alone, ignoring everywhere else it has been run.
-    pub fn dir_rank(&self, dir: u64, name: &str) -> f32 {
-        // `HashMap::get` on a tuple key needs an owned String, and this runs a
-        // few hundred times per resolve at most.
-        self.dirs
-            .get(&(dir, name.to_owned()))
-            .map_or(0.0, |(rank, last)| frecency(*rank, *last, now()))
+    pub fn ranker(&self, scope: u64, at: u64) -> impl Fn(&str) -> f32 + '_ {
+        let words = self.scoped.get(&scope);
+        move |name| {
+            words
+                .and_then(|w| w.get(name))
+                .map_or(0.0, |(rank, last)| frecency(*rank, *last, at))
+        }
+    }
+
+    pub fn scope_knows(&self, scope: u64, name: &str) -> bool {
+        self.scoped
+            .get(&scope)
+            .is_some_and(|words| words.contains_key(name))
+    }
+
+    pub fn in_scope(&self, scope: u64) -> Vec<Entry> {
+        self.scoped
+            .get(&scope)
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| !name.starts_with(MARKER))
+            .map(|(name, (rank, last))| Entry {
+                name: name.clone(),
+                kind: Kind::External,
+                rank: *rank,
+                last: *last,
+            })
+            .collect()
+    }
+
+    pub fn verbs(&self, parent: &str) -> Vec<Entry> {
+        let mut found = self.in_scope(sub_scope(parent));
+        found.retain(|entry| entry.rank >= VERB_CONFIDENCE);
+        found
+    }
+
+    pub fn takes_verbs(&self, parent: &str) -> bool {
+        self.verbs(parent).len() >= VERBS_TO_QUALIFY
+    }
+
+    pub fn asked_for_help(&self, parent: &str) -> bool {
+        self.scope_knows(sub_scope(parent), ASKED)
+    }
+
+    pub fn mark_asked(&mut self, parent: &str) {
+        self.bump_in(sub_scope(parent), ASKED, VERB_CONFIDENCE);
+    }
+
+    fn scoped_len(&self) -> usize {
+        self.scoped.values().map(HashMap::len).sum()
     }
 
     pub fn forget(&mut self, name: &str) -> bool {
         let before = self.entries.len();
         self.entries.retain(|e| e.name != name);
-        self.dirs.retain(|(_, cmd), _| cmd != name);
+        self.scoped.remove(&sub_scope(name));
+        for words in self.scoped.values_mut() {
+            words.remove(name);
+        }
         self.bindings.retain(|b| b.target != name);
         self.dirty = true;
         self.entries.len() != before
     }
 
+    /// Bindings and the ignore list too: they are answers the database gives,
+    /// and leaving them behind made `forget --all` report an empty database
+    /// that still corrected things.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.dirs.clear();
+        self.scoped.clear();
+        self.bindings.clear();
+        self.ignored.clear();
         self.dirty = true;
     }
 
@@ -319,29 +469,16 @@ impl Store {
     pub fn unignore(&mut self, name: &str) -> bool {
         let before = self.ignored.len();
         self.ignored.retain(|n| n != name);
-        self.dirty = self.dirty || self.ignored.len() != before;
+        self.dirty |= self.ignored.len() != before;
         self.ignored.len() != before
     }
 
-    pub fn binding(&self, input: &str, target: &str) -> Option<&Binding> {
-        self.bindings
-            .iter()
-            .find(|b| b.input == input && b.target == target)
-    }
-
-    /// The correction to use for `input` without asking anything else, if the
-    /// user has confirmed it often enough (or pinned it).
     pub fn sticky(&self, input: &str) -> Option<&str> {
         self.bindings
             .iter()
             .filter(|b| b.input == input && b.weight >= STICKY_AT)
             .max_by_key(|b| b.weight)
             .map(|b| b.target.as_str())
-    }
-
-    pub fn buried(&self, input: &str, target: &str) -> bool {
-        self.binding(input, target)
-            .is_some_and(|b| b.weight <= BURIED_AT)
     }
 
     pub fn nudge_binding(&mut self, input: &str, target: &str, by: i32) {
@@ -391,30 +528,39 @@ impl Store {
         self.entries.retain(|e| e.rank >= AGE_FLOOR);
     }
 
-    fn evict_dirs(&mut self) {
+    fn evict_scoped(&mut self) {
         let at = now();
         let mut scored: Vec<_> = self
-            .dirs
+            .scoped
             .iter()
-            .map(|(key, (rank, last))| (key.clone(), frecency(*rank, *last, at)))
+            .flat_map(|(scope, words)| {
+                words.iter().map(move |(name, (rank, last))| {
+                    (
+                        *scope,
+                        name,
+                        *rank >= VERB_CONFIDENCE,
+                        frecency(*rank, *last, at),
+                    )
+                })
+            })
             .collect();
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scored.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.3.total_cmp(&a.3)));
         let keep: std::collections::HashSet<_> = scored
             .into_iter()
-            .take(MAX_DIR_ENTRIES * 3 / 4)
-            .map(|(key, _)| key)
+            .take(MAX_SCOPED / 2)
+            .map(|(scope, name, _, _)| (scope, name.clone()))
             .collect();
-        self.dirs.retain(|key, _| keep.contains(key));
+        self.scoped.retain(|scope, words| {
+            words.retain(|name, _| keep.contains(&(*scope, name.clone())));
+            !words.is_empty()
+        });
     }
 
-    /// Write through a temporary file in the same directory so a reader either
-    /// sees the old database or the new one, never half of either.
     fn write(&self, path: &Path) -> io::Result<()> {
         if !self.dirty || self.read_only {
             return Ok(());
         }
         if let Some(parent) = path.parent() {
-            // A log of everything the user runs is nobody else's business.
             fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -423,17 +569,14 @@ impl Store {
 
         let temp = path.with_extension(format!("tmp.{}", std::process::id()));
         let written = (|| {
-            let mut file = fs::OpenOptions::new()
+            fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(&temp)?;
-            file.write_all(&self.encode())?;
-            // Deliberately no fsync. It measured at 5ms on APFS, and this runs
-            // once per command the user types; the rename is still atomic, so
-            // the worst a power cut can cost is the last few rank bumps, which
-            // `zcomplete import` can rebuild from shell history anyway.
+                .open(&temp)?
+                .write_all(&self.encode())?;
+            // No fsync: 5ms on APFS, once per command. The rename is still atomic.
             fs::rename(&temp, path)
         })();
         if written.is_err() {
@@ -443,7 +586,7 @@ impl Store {
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(64 * self.entries.len() + 64);
+        let mut out = Vec::with_capacity(32 * self.entries.len() + 1024);
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&FORMAT.to_le_bytes());
 
@@ -455,12 +598,14 @@ impl Store {
             out.extend_from_slice(&entry.last.to_le_bytes());
         }
 
-        put_u32(&mut out, self.dirs.len());
-        for ((dir, name), (rank, last)) in &self.dirs {
-            out.extend_from_slice(&dir.to_le_bytes());
-            put_str(&mut out, name);
-            out.extend_from_slice(&rank.to_le_bytes());
-            out.extend_from_slice(&last.to_le_bytes());
+        put_u32(&mut out, self.scoped_len());
+        for (scope, words) in &self.scoped {
+            for (name, (rank, last)) in words {
+                out.extend_from_slice(&scope.to_le_bytes());
+                put_str(&mut out, name);
+                out.extend_from_slice(&rank.to_le_bytes());
+                out.extend_from_slice(&last.to_le_bytes());
+            }
         }
 
         put_u32(&mut out, self.bindings.len());
@@ -475,6 +620,9 @@ impl Store {
         for name in &self.ignored {
             put_str(&mut out, name);
         }
+
+        out.push(self.mode.tag());
+        out.push(u8::from(self.enabled));
         out
     }
 
@@ -487,10 +635,15 @@ fn put_u32(out: &mut Vec<u8>, value: usize) {
     out.extend_from_slice(&(value as u32).to_le_bytes());
 }
 
+/// Cut rather than written with a wrapped length, which would desync the
+/// reader and lose the whole file.
 fn put_str(out: &mut Vec<u8>, value: &str) {
-    let bytes = value.as_bytes();
-    out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-    out.extend_from_slice(bytes);
+    let mut end = value.len().min(u16::MAX as usize);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.extend_from_slice(&(end as u16).to_le_bytes());
+    out.extend_from_slice(&value.as_bytes()[..end]);
 }
 
 struct Reader<'a> {
@@ -510,6 +663,10 @@ impl<'a> Reader<'a> {
 
     fn array<const N: usize>(&mut self) -> Field<[u8; N]> {
         self.take(N)?.try_into().map_err(|_| Broken::Garbled)
+    }
+
+    fn byte(&mut self) -> Field<u8> {
+        Ok(self.take(1)?[0])
     }
 
     fn u16(&mut self) -> Field<u16> {
@@ -541,11 +698,10 @@ impl<'a> Reader<'a> {
 
     fn count(&mut self) -> Field<usize> {
         let count = self.u32()? as usize;
-        // A length field can only be honest if the bytes to fill it exist.
-        if count > self.bytes.len() - self.at {
-            return Err(Broken::Garbled);
+        match count > self.bytes.len() - self.at {
+            true => Err(Broken::Garbled),
+            false => Ok(count),
         }
-        Ok(count)
     }
 }
 
@@ -555,28 +711,34 @@ fn decode(bytes: &[u8]) -> Field<Store> {
         return Err(Broken::Garbled);
     }
     match reader.u32()? {
-        FORMAT => {}
-        newer if newer > FORMAT => return Err(Broken::TooNew),
-        _ => return Err(Broken::Garbled),
+        version if version > FORMAT => return Err(Broken::TooNew),
+        0 => return Err(Broken::Garbled),
+        _ => {}
     }
 
     let mut store = Store::default();
 
-    for _ in 0..reader.count()? {
+    let count = reader.count()?;
+    store.entries.reserve_exact(count);
+    for _ in 0..count {
         store.entries.push(Entry {
             name: reader.string()?,
-            kind: Kind::from_tag(reader.take(1)?[0]),
+            kind: Kind::from_tag(reader.byte()?),
             rank: reader.f32()?,
             last: reader.u64()?,
         });
     }
 
     for _ in 0..reader.count()? {
-        let dir = reader.u64()?;
+        let scope = reader.u64()?;
         let name = reader.string()?;
         let rank = reader.f32()?;
         let last = reader.u64()?;
-        store.dirs.insert((dir, name), (rank, last));
+        store
+            .scoped
+            .entry(scope)
+            .or_default()
+            .insert(name, (rank, last));
     }
 
     for _ in 0..reader.count()? {
@@ -592,71 +754,57 @@ fn decode(bytes: &[u8]) -> Field<Store> {
         store.ignored.push(reader.string()?);
     }
 
-    if store.entries.iter().any(|e| !e.rank.is_finite()) {
-        return Err(Broken::Garbled);
+    // Absent in a version 1 file, which is the point of putting it last.
+    store.mode = reader
+        .byte()
+        .ok()
+        .and_then(Mode::from_tag)
+        .unwrap_or_default();
+    store.enabled = reader.byte().map_or(true, |byte| byte != 0);
+
+    match store.entries.iter().any(|e| !e.rank.is_finite()) {
+        true => Err(Broken::Garbled),
+        false => Ok(store),
     }
-    Ok(store)
 }
 
-/// Advisory lock around the read-modify-write window. Shells fire commands fast
-/// enough that two of them genuinely overlap, and without this the second one
-/// to save silently discards the first one's counts.
-struct Lock(PathBuf);
-
-/// The lock is only ever held for a read-modify-write of a few hundred
-/// kilobytes, so waiting this long already means something is wrong. It used to
-/// be two seconds, which is what a confirmation prompt cost every other shell
-/// back when the lock spanned the question.
-const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(400);
-const LOCK_ABANDONED: u64 = 10;
+/// Closing the file releases the lock, so there is no `Drop` of our own and
+/// nothing to unlink.
+struct Lock {
+    _file: fs::File,
+}
 
 impl Lock {
+    /// `flock` rather than a sentinel file the first writer creates: the kernel
+    /// hands it back when the holder dies, so a killed shell leaves nothing for
+    /// the next one to guess about, and there is no unlink for two processes to
+    /// race. Waiting outright is only safe because no caller holds it across a
+    /// prompt; every one of them commits first and asks afterwards.
     fn take(db: &Path) -> Option<Lock> {
         let path = db.with_extension("lock");
-        if let Some(parent) = path.parent() {
-            let _ = fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent);
-        }
-        let deadline = std::time::Instant::now() + LOCK_PATIENCE;
-        loop {
+        let mut made_dir = false;
+        let file = loop {
             match fs::OpenOptions::new()
                 .write(true)
-                .create_new(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
                 .open(&path)
             {
-                Ok(_) => return Some(Lock(path)),
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                    if abandoned(&path) {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        // Losing one rank increment beats blocking the prompt.
-                        return None;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                Ok(file) => break file,
+                Err(err) if err.kind() == io::ErrorKind::NotFound && !made_dir => {
+                    made_dir = true;
+                    fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(path.parent()?)
+                        .ok()?;
                 }
-                // An unwritable data directory is the caller's problem; let the
-                // save itself produce the real error.
                 Err(_) => return None,
             }
-        }
-    }
-}
-
-/// A lock file left behind by a process that died holding it.
-fn abandoned(path: &Path) -> bool {
-    match fs::metadata(path).and_then(|meta| meta.modified()) {
-        Ok(at) => at.elapsed().is_ok_and(|age| age.as_secs() > LOCK_ABANDONED),
-        Err(_) => false,
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        };
+        let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0;
+        held.then_some(Lock { _file: file })
     }
 }
 
@@ -688,9 +836,72 @@ mod tests {
         assert_eq!(back.entries.len(), 3);
         assert_eq!(back.get("gs").unwrap().kind, Kind::Shell(Shell::Zsh));
         assert_eq!(back.get("clear").unwrap().rank, 3.0);
-        assert_eq!(back.binding("mkd", "mkdir").unwrap().weight, 2);
+        let binding = back
+            .bindings
+            .iter()
+            .find(|b| b.input == "mkd" && b.target == "mkdir");
+        assert_eq!(binding.unwrap().weight, 2);
         assert!(back.is_ignored("sl"));
-        assert!(back.dir_rank(dir_key(Path::new("/tmp/project")), "make") > 0.0);
+        assert!(back.ranker(dir_key(Path::new("/tmp/project")), now())("make") > 0.0);
+    }
+
+    #[test]
+    fn emptying_the_database_leaves_nothing_that_still_answers() {
+        let path = scratch("clear");
+        let mut store = edit(&path);
+        store.bump("mkdir", Kind::External, 1.0);
+        store.nudge_binding("mkd", "mkdir", 2);
+        store.ignore("sl");
+        store.clear();
+        store.commit().unwrap();
+
+        let back = Store::open(&path);
+        assert!(back.entries.is_empty());
+        assert!(back.bindings.is_empty());
+        assert!(!back.is_ignored("sl"));
+        assert!(back.sticky("mkd").is_none());
+    }
+
+    #[test]
+    fn a_database_from_before_the_settings_trailer_still_reads() {
+        let mut store = Store::default();
+        store.bump("mkdir", Kind::External, 7.0);
+        store.set_mode(Mode::Bypass);
+
+        let mut bytes = store.encode();
+        bytes.truncate(bytes.len() - 2);
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+
+        let back = decode(&bytes).ok().expect("a version 1 file is readable");
+        assert_eq!(back.get("mkdir").unwrap().rank, 7.0);
+        assert_eq!(back.mode(), Mode::Safe, "an absent setting is the default");
+        assert!(back.enabled());
+    }
+
+    #[test]
+    fn a_directory_and_a_command_of_the_same_name_are_different_scopes() {
+        let mut store = Store::default();
+        store.bump_in(dir_key(Path::new("git")), "status", 5.0);
+        assert!(!store.scope_knows(sub_scope("git"), "status"));
+
+        store.bump_in(sub_scope("git"), "status", 1.0);
+        assert!(store.scope_knows(sub_scope("git"), "status"));
+        assert_eq!(
+            store.in_scope(sub_scope("git")).len(),
+            1,
+            "the directory's ranks leaked into the command's scope"
+        );
+    }
+
+    #[test]
+    fn forgetting_a_command_takes_its_subcommands_and_bindings_with_it() {
+        let mut store = Store::default();
+        store.bump("git", Kind::External, 1.0);
+        store.bump_in(sub_scope("git"), "status", 3.0);
+        store.nudge_binding("gti", "git", 5);
+        assert!(store.forget("git"));
+        assert!(store.in_scope(sub_scope("git")).is_empty());
+        assert!(store.sticky("gti").is_none());
     }
 
     #[test]
@@ -745,16 +956,25 @@ mod tests {
         store.bump("mkdir", Kind::External, 1.0);
         store.commit().unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "mode was {:o}", mode);
+        assert_eq!(mode & 0o077, 0, "mode was {mode:o}");
     }
 
     #[test]
     fn recent_use_outranks_a_stale_habit() {
         let at = now();
-        let fresh = frecency(1.0, at, at);
         let stale = frecency(20.0, at - 40 * DAY, at);
-        assert!(fresh < stale, "frequency should still win at 20x the rank");
+        assert!(frecency(1.0, at, at) < stale, "frequency should still win");
         assert!(frecency(6.0, at, at) > stale);
+    }
+
+    #[test]
+    fn an_absurdly_long_name_does_not_destroy_the_database() {
+        let mut store = Store::default();
+        store.bump("mkdir", Kind::External, 3.0);
+        store.ignore(&"x".repeat(70_000));
+        let back = decode(&store.encode()).ok().expect("still readable");
+        assert_eq!(back.get("mkdir").unwrap().rank, 3.0);
+        assert_eq!(back.ignored[0].len(), u16::MAX as usize);
     }
 
     #[test]
@@ -765,14 +985,5 @@ mod tests {
         }
         let total: f32 = store.entries.iter().map(|e| e.rank).sum();
         assert!(total <= AGE_CEILING * 1.05, "total rank ran away: {total}");
-    }
-
-    #[test]
-    fn forgetting_a_command_takes_its_bindings_with_it() {
-        let mut store = Store::default();
-        store.bump("mkdir", Kind::External, 1.0);
-        store.nudge_binding("mkd", "mkdir", 5);
-        assert!(store.forget("mkdir"));
-        assert!(store.sticky("mkd").is_none());
     }
 }

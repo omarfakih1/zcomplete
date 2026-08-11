@@ -1,0 +1,78 @@
+name: release
+
+# Tagging is what publishes. install.sh fetches
+# zcomplete-<target>.tar.gz and its .sha256 from the release these build.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          # musl, so one Linux binary runs whatever the distro's glibc is.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          # Arm runners are free for public repositories. Drop this entry if
+          # yours is private and you would rather not pay for it.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: musl toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      - name: package
+        run: |
+          set -eu
+          name=zcomplete-${{ matrix.target }}.tar.gz
+          tar -czf "$name" -C target/${{ matrix.target }}/release zcomplete
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name" > "$name.sha256"
+          else
+            shasum -a 256 "$name" > "$name.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            zcomplete-${{ matrix.target }}.tar.gz
+            zcomplete-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --generate-notes || true
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            zcomplete-*.tar.gz zcomplete-*.tar.gz.sha256

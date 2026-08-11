@@ -10,6 +10,7 @@ prompts by typing at it.
 Usage:  python3 tests/shells.py [zsh|bash|fish]...
 """
 
+import fcntl
 import os
 import pty
 import re
@@ -99,7 +100,7 @@ class Session:
         """Send a command, wait for it to finish, return (output, exit status).
 
         Lines end in a carriage return, which is what a terminal sends when the
-        user presses enter — fish binds that key, and sending a line feed
+        user presses enter. fish binds that key, and sending a line feed
         instead quietly bypassed the binding."""
         self.counter += 1
         marker = f"ZC{self.counter}"
@@ -126,7 +127,7 @@ class Session:
         return "\n".join(ANSI.sub("", self.buffer).splitlines()[-lines:])
 
     def close(self):
-        """Wait for the shell to really exit — bash writes its history on the
+        """Wait for the shell to really exit. bash writes its history on the
         way out, and the temporary home is deleted the moment we return."""
         try:
             self.type("exit\r")
@@ -194,14 +195,39 @@ def find_shell(kind):
     return shutil.which(kind)
 
 
-# A fixed, tiny PATH. The host's real PATH would make every assertion depend on
-# whichever binaries happen to be installed, and one of them turned out to be an
-# interactive tool that a bypass-mode correction happily ran.
+# A fixed, tiny PATH: the host's real one made every assertion depend on what
+# happened to be installed, and one of those turned out to be an interactive
+# tool that a bypass-mode correction happily ran.
 FAKE_PATH = [
     "mkdir", "clear", "rm", "cat", "ls", "sleep", "true", "false", "printf",
     "echo", "git", "uname", "sed", "tr", "grep", "stty", "tty", "dirname",
     "basename", "env", "id", "hostname", "date", "cut", "head", "tail",
 ]
+
+
+def learned_names(text):
+    """Names out of `zcomplete stats`: `score  last used  name [(shell)]`."""
+    names = []
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if not fields:
+            continue
+        names.append(fields[-2] if fields[-1].startswith("(") else fields[-1])
+    return names
+
+
+# `stats` prints frecency, and anything used within the hour scores four times
+# its rank. A test run is always inside that hour, so this divides back out.
+RECENT_MULTIPLIER = 4.0
+
+
+def learned_rank(text, name):
+    """The rank `stats` implies for one command, or 0.0 if it is not listed."""
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if fields and (fields[-2] if fields[-1].startswith("(") else fields[-1]) == name:
+            return float(fields[0]) / RECENT_MULTIPLIER
+    return 0.0
 
 
 def build_path(home):
@@ -221,12 +247,10 @@ class Scenario:
         self.exe = exe
         self.home = home
         self.data = home / "data"
-        self.config = home / "config.toml"
         env = dict(os.environ)
         env.update(
             PATH=str(build_path(home)),
             ZCOMPLETE_DATA_DIR=str(self.data),
-            ZCOMPLETE_CONFIG=str(self.config),
             HOME=str(home),
             TERM="xterm-256color",
             NO_COLOR="1",
@@ -269,7 +293,7 @@ def cold_start_works(sc):
     assert (sc.home / "nothing-learned-yet").is_dir(), "PATH fallback did not fire"
 
 
-@check("learns from preexec and corrects a prefix")
+@check("learns what ran and corrects a prefix")
 def learns_and_corrects(sc):
     sc.mode("bypass")
     sc.session.run("mkdir -p base")
@@ -284,7 +308,7 @@ def never_learns_a_non_command(sc):
     for _ in range(3):
         sc.session.run("clean --all")
     sc.session.run("clear")
-    learned = [line.split("\t")[0] for line in sc.zcomplete("export").stdout.splitlines()]
+    learned = learned_names(sc.zcomplete("stats", "-n", "500").stdout)
     assert "clean" not in learned, f"'clean' should never enter the database: {learned}"
     resolved = sc.zcomplete("query", "cle").stdout.strip()
     assert resolved == "clear", f"expected clear, got {resolved!r}"
@@ -524,7 +548,7 @@ def awkward_names_are_learned(sc):
     sc.session.run("my-tool")
     sc.session.run("my_helper")
 
-    learned = [line.split("\t")[0] for line in sc.zcomplete("export").stdout.splitlines()]
+    learned = learned_names(sc.zcomplete("stats", "-n", "500").stdout)
     assert "my-tool" in learned, f"a hyphenated command was not learned: {learned}"
     assert "my_helper" in learned, f"a shell function was not learned: {learned}"
 
@@ -536,11 +560,7 @@ def awkward_names_are_learned(sc):
 def counted_once(sc):
     sc.mode("bypass")
     sc.session.run("mkdir -p seed-count")
-    rank = lambda: next(
-        (float(l.split("\t")[1]) for l in sc.zcomplete("export").stdout.splitlines()
-         if l.startswith("mkdir\t")),
-        0.0,
-    )
+    rank = lambda: learned_rank(sc.zcomplete("stats", "-n", "500").stdout, "mkdir")
     before = rank()
     sc.session.run("mkd counted-once")
     # fish rewrites the line before running it, so its preexec hook sees the
@@ -561,6 +581,107 @@ def background_never_prompts(sc):
     assert not (sc.home / "backgrounded").exists(), "corrected without being able to ask"
 
 
+# zcomplete is its own fixture for these: it takes subcommands, it is already on
+# the fake PATH, and it fails loudly on a verb it does not have. Using git would
+# drag in the host's repositories and identity.
+def teach_verbs(sc):
+    """A command's second word is only read as a verb once it has earned it: the
+    word has to come back, and the command needs two such words before it counts
+    as taking verbs at all. Nothing is on a list, so the fixture has to use it."""
+    for _ in range(2):
+        sc.session.run("zcomplete stats")
+        sc.session.run("zcomplete doctor")
+
+
+@check("a mistyped subcommand runs the one you meant")
+def subcommand_is_corrected(sc):
+    sc.mode("bypass")
+    teach_verbs(sc)
+    out, code = sc.session.run("zcomplete sttas")
+    assert "last used" in out, f"the corrected subcommand did not run:\n{out}"
+
+
+@check("a command whose second word is data never takes verbs")
+def data_arguments_do_not_become_subcommands(sc):
+    sc.mode("bypass")
+    # Every grep here succeeds, and every pattern is different, which is exactly
+    # what stops any of them from becoming a subcommand of grep.
+    sc.session.run("printf 'alpha\\nbeta\\ngamma\\n' > words.txt")
+    for pattern in ("alpha", "beta", "gamma", "amm"):
+        sc.session.run(f"grep {pattern} words.txt")
+    learned = sc.zcomplete("stats", "grep").stdout
+    assert "nothing learned" in learned, f"grep grew a vocabulary:\n{learned}"
+    # And a failed grep is left to report its own failure.
+    assert sc.zcomplete("query", "grep", "alpa").returncode != 0
+
+
+@check("u fixes the command and its subcommand at once")
+def both_words_can_be_fixed_together(sc):
+    sc.mode("safe")
+    teach_verbs(sc)
+    sc.session.type("zcomp stat\r")
+    assert sc.session.expect("u: also stat"), sc.session.tail()
+    answered = len(sc.session.buffer)
+    sc.session.type("u")
+    sc.session.drain(0.8)
+    after = ANSI.sub("", sc.session.buffer[answered:])
+    assert "last used" in after, f"u did not fix both words:\n{after}"
+
+
+@check("y leaves the subcommand alone")
+def the_command_can_be_fixed_on_its_own(sc):
+    sc.mode("safe")
+    teach_verbs(sc)
+    sc.session.type("zcomp stat\r")
+    assert sc.session.expect("u: also stat"), sc.session.tail()
+    answered = len(sc.session.buffer)
+    sc.session.type("y")
+    sc.session.drain(0.8)
+    after = ANSI.sub("", sc.session.buffer[answered:])
+    assert "unknown command 'stat'" in after, f"y should have run zcomplete stat:\n{after}"
+
+
+@check("a subcommand is only learned once it has worked")
+def a_failed_verb_is_never_learned(sc):
+    sc.mode("safe")
+    teach_verbs(sc)
+    sc.session.type("zcomplete sttas\r")
+    assert sc.session.expect("zcomplete: run zcomplete stats"), sc.session.tail()
+    sc.session.type("n")
+    sc.session.drain(0.5)
+    learned = sc.zcomplete("stats", "zcomplete").stdout
+    assert "zcomplete stats" in learned, f"the working verb was not learned:\n{learned}"
+    assert "sttas" not in learned, f"a verb that has never worked was learned:\n{learned}"
+    # And having refused it, the correction is not offered a third time.
+    assert sc.zcomplete("query", "zcomplete", "sttas").returncode == 0
+
+
+@check("a real subcommand that fails is left alone")
+def a_working_verb_is_not_second_guessed(sc):
+    sc.mode("bypass")
+    sc.session.run("zcomplete bind zz mkdir")
+    sc.session.run("zcomplete unbind zz")
+    # Now it is bound to nothing, so unbind fails - on its own merits, not
+    # because `unbind` is a mistyping of anything.
+    out, code = sc.session.run("zcomplete unbind zz")
+    assert code != 0, f"expected the second unbind to fail: {out}"
+    assert "was not bound" in out, out
+    assert "->" not in out, f"a working subcommand got corrected:\n{out}"
+
+
+@check("a subcommand correction obeys the mode")
+def subcommand_correction_can_be_declined(sc):
+    sc.mode("safe")
+    teach_verbs(sc)
+    sc.session.type("zcomplete sttas\r")
+    assert sc.session.expect("zcomplete: run zcomplete stats"), sc.session.tail()
+    answered = len(sc.session.buffer)
+    sc.session.type("n")
+    sc.session.drain(0.6)
+    after = ANSI.sub("", sc.session.buffer[answered:])
+    assert "last used" not in after, f"n still ran it:\n{after}"
+
+
 @check("a pinned shortcut wins outright")
 def pinned_shortcut_wins(sc):
     sc.mode("bypass")
@@ -576,7 +697,7 @@ def concurrent_writes_all_land():
     lock has to span the read as well as the write, which it did not at first:
     260 of 400 increments went missing."""
     with tempfile.TemporaryDirectory() as tmp:
-        env = dict(os.environ, ZCOMPLETE_DATA_DIR=f"{tmp}/data", ZCOMPLETE_CONFIG=f"{tmp}/c.toml")
+        env = dict(os.environ, ZCOMPLETE_DATA_DIR=f"{tmp}/data")
         binary = str(BIN / "zcomplete")
         workers = [
             subprocess.Popen(
@@ -587,31 +708,56 @@ def concurrent_writes_all_land():
         ]
         for worker in workers:
             worker.wait()
-        dump = subprocess.run([binary, "export"], capture_output=True, text=True, env=env).stdout
-        rank = next((float(l.split("\t")[1]) for l in dump.splitlines() if l.startswith("mkdir\t")), 0)
+        dump = subprocess.run(
+            [binary, "stats", "-n", "500"], capture_output=True, text=True, env=env
+        ).stdout
+        rank = learned_rank(dump, "mkdir")
         assert rank == 400, f"expected 400 increments, kept {rank}"
-        assert not list(Path(f"{tmp}/data").glob("*.lock")), "a lock file was left behind"
+        # The lock file itself stays: it is flock'd, not created and unlinked,
+        # which is why a killed shell no longer leaves the next one guessing.
+        # What must not survive is the lock, so it has to be free now.
+        for lock in Path(f"{tmp}/data").glob("*.lock"):
+            with open(lock) as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(held, fcntl.LOCK_UN)
 
 
 def only_real_commands_are_offered():
     """The core invariant, end to end: a heavily-used word that is not installed
-    must never win over a barely-used word that is. Built as a mutation test —
-    removing the executability filter has to make this fail."""
+    must never win over a barely-used word that is. Built as a mutation test:
+    removing the executability filter has to make this fail.
+
+    The stale entries are made the way real ones go stale, by learning a command
+    that is installed and then uninstalling it. Nothing can put a word that was
+    never a command into the database, which is the point of the invariant."""
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp)
+        bindir = build_path(home)
         env = dict(
             os.environ,
-            PATH=str(build_path(home)),
+            PATH=str(bindir),
             ZCOMPLETE_DATA_DIR=f"{tmp}/data",
-            ZCOMPLETE_CONFIG=f"{tmp}/c.toml",
         )
         binary = str(BIN / "zcomplete")
-        seed = home / "seed.tsv"
-        seed.write_text(
-            "".join(f"{n}\t500.000\t{int(time.time())}\n" for n in ("clean", "gitx", "mkdirp"))
-            + "".join(f"{n}\t2.000\t{int(time.time())}\n" for n in ("clear", "git", "mkdir"))
-        )
-        subprocess.run([binary, "import", "--restore", str(seed)], capture_output=True, env=env)
+
+        def record(name, times):
+            for _ in range(times):
+                subprocess.run(
+                    [binary, "record", "--shell", "zsh", "--kind", "auto", "--", name],
+                    capture_output=True,
+                    env=env,
+                )
+
+        doomed = ("clean", "gitx", "mkdirp")
+        for name in doomed:
+            (bindir / name).write_text("#!/bin/sh\n")
+            (bindir / name).chmod(0o755)
+            record(name, 8)
+        for name in ("clear", "git", "mkdir"):
+            record(name, 1)
+        # And now they are gone, exactly as an uninstalled tool is.
+        for name in doomed:
+            (bindir / name).unlink()
 
         for typed, want in (("cle", "clear"), ("git", "git"), ("mkd", "mkdir")):
             got = subprocess.run(
