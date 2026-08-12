@@ -78,6 +78,9 @@ impl Tty {
             Raw::poll_briefly(&self.file);
             let _ = self.file.read(&mut [0u8; 16]);
         }
+        // Anything else left in the buffer stays there on purpose. Typing the
+        // next command while a question is up is a thing people do, and eating
+        // it to catch the `es` in an `yes` would cost more than it saves.
         Some(first as char)
     }
 

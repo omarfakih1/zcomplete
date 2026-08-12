@@ -7,7 +7,10 @@ zmodload zsh/datetime
 
 entries=${1:-2000}
 root=${0:a:h:h}
-bin=$root/target/release/zcomplete
+# Not $root/target: `.cargo/config.toml` moves the build off a synced folder.
+target=${CARGO_TARGET_DIR:-$(cd $root && cargo metadata --format-version 1 --no-deps 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)}
+bin=${target:-$root/target}/release/zcomplete
 [[ -x $bin ]] || { print -u2 "build first: cargo build --release"; exit 1 }
 
 work=$(mktemp -d)

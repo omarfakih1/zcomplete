@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: [u8; 4] = *b"ZCDB";
@@ -163,6 +164,12 @@ type Ranks = HashMap<String, (f32, u64)>;
 
 pub struct Store {
     pub entries: Vec<Entry>,
+    /// The scoped section as it came off disk, plus an index built on first
+    /// use. Every caller wants one scope, and decoding all of them into nested
+    /// maps was three quarters of the cost of opening the database.
+    raw: Vec<u8>,
+    index: OnceLock<HashMap<u64, Vec<u32>>>,
+    /// Scopes that have been read into memory. Overrides `raw` for those ids.
     scoped: HashMap<u64, Ranks>,
     pub bindings: Vec<Binding>,
     pub ignored: Vec<String>,
@@ -176,6 +183,8 @@ impl Default for Store {
     fn default() -> Store {
         Store {
             entries: Vec::new(),
+            raw: Vec::new(),
+            index: OnceLock::new(),
             scoped: HashMap::new(),
             bindings: Vec::new(),
             ignored: Vec::new(),
@@ -212,6 +221,13 @@ pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// One decimal place without `core::fmt`'s float printer, which is nine
+/// kilobytes of binary linked in for two commands that print a diagnostic.
+pub fn tenths(value: f32) -> String {
+    let scaled = (value.max(0.0) * 10.0).round() as u64;
+    format!("{}.{}", scaled / 10, scaled % 10)
 }
 
 pub fn frecency(rank: f32, last: u64, now: u64) -> f32 {
@@ -260,6 +276,13 @@ pub fn edit(path: &Path) -> Editing {
 }
 
 impl Editing {
+    /// Whether this edit actually holds the lock. `flock` fails outright on some
+    /// network mounts, and a caller about to consume something it cannot put
+    /// back wants to know that before it starts rather than after.
+    pub fn locked(&self) -> bool {
+        self.lock.is_some()
+    }
+
     pub fn commit(mut self) -> io::Result<Store> {
         let result = self.store.write(&self.path);
         self.lock = None;
@@ -356,7 +379,12 @@ impl Store {
     }
 
     pub fn bump(&mut self, name: &str, kind: Kind, by: f32) {
-        self.slot(name, kind, by, now()).kind = kind;
+        self.absorb(name, kind, by, now());
+    }
+
+    /// `bump` for something that happened earlier: the journal records when.
+    pub fn absorb(&mut self, name: &str, kind: Kind, by: f32, at: u64) {
+        self.slot(name, kind, by, at).kind = kind;
         self.age();
     }
 
@@ -368,48 +396,111 @@ impl Store {
         self.age();
     }
 
+    /// Where every record of each scope starts in `raw`. One pass that reads a
+    /// scope id and steps over the rest, so nothing is allocated per word.
+    fn index(&self) -> &HashMap<u64, Vec<u32>> {
+        self.index.get_or_init(|| {
+            let mut found: HashMap<u64, Vec<u32>> = HashMap::new();
+            let mut at = 0usize;
+            while at + 10 <= self.raw.len() {
+                let start = at;
+                let scope = u64::from_le_bytes(self.raw[at..at + 8].try_into().expect("8 bytes"));
+                let len =
+                    u16::from_le_bytes(self.raw[at + 8..at + 10].try_into().expect("2 bytes"));
+                at += 10 + len as usize + 12;
+                if at > self.raw.len() {
+                    break;
+                }
+                found.entry(scope).or_default().push(start as u32);
+            }
+            found
+        })
+    }
+
+    fn record_at(&self, start: u32) -> Option<(&str, f32, u64)> {
+        let at = start as usize;
+        let len = u16::from_le_bytes(self.raw.get(at + 8..at + 10)?.try_into().ok()?) as usize;
+        let name = std::str::from_utf8(self.raw.get(at + 10..at + 10 + len)?).ok()?;
+        let tail = self.raw.get(at + 10 + len..at + 10 + len + 12)?;
+        let rank = f32::from_le_bytes(tail[..4].try_into().ok()?);
+        let last = u64::from_le_bytes(tail[4..].try_into().ok()?);
+        Some((name, rank, last))
+    }
+
+    /// One scope, in memory if it has been written to and off disk otherwise.
+    fn words(&self, scope: u64) -> Ranks {
+        if let Some(words) = self.scoped.get(&scope) {
+            return words.clone();
+        }
+        self.index()
+            .get(&scope)
+            .into_iter()
+            .flatten()
+            .filter_map(|start| self.record_at(*start))
+            .map(|(name, rank, last)| (name.to_owned(), (rank, last)))
+            .collect()
+    }
+
+    /// Pulls a scope out of `raw` so it can be written to. Records for it stay
+    /// in `raw` and are skipped at encode time, which is cheaper than rebuilding
+    /// the section every time one word changes.
+    fn open_scope(&mut self, scope: u64) -> &mut Ranks {
+        if !self.scoped.contains_key(&scope) {
+            let words = self.words(scope);
+            self.scoped.insert(scope, words);
+        }
+        self.scoped.get_mut(&scope).expect("just inserted")
+    }
+
     pub fn bump_in(&mut self, scope: u64, name: &str, by: f32) {
-        let at = now();
+        self.bump_in_at(scope, name, by, now());
+    }
+
+    pub fn bump_in_at(&mut self, scope: u64, name: &str, by: f32, at: u64) {
         self.dirty = true;
         let slot = self
-            .scoped
-            .entry(scope)
-            .or_default()
+            .open_scope(scope)
             .entry(name.to_owned())
             .or_insert((0.0, at));
         slot.0 += by;
-        slot.1 = at;
+        // Never backwards: journal lines arrive out of order, and one from a
+        // shell that died last week must not age today's use.
+        slot.1 = slot.1.max(at);
         if self.scoped_len() > MAX_SCOPED {
             self.evict_scoped();
         }
     }
 
     pub fn ranker(&self, scope: u64, at: u64) -> impl Fn(&str) -> f32 + '_ {
-        let words = self.scoped.get(&scope);
+        let words = self.words(scope);
         move |name| {
             words
-                .and_then(|w| w.get(name))
+                .get(name)
                 .map_or(0.0, |(rank, last)| frecency(*rank, *last, at))
         }
     }
 
     pub fn scope_knows(&self, scope: u64, name: &str) -> bool {
-        self.scoped
-            .get(&scope)
-            .is_some_and(|words| words.contains_key(name))
+        match self.scoped.get(&scope) {
+            Some(words) => words.contains_key(name),
+            None => self
+                .index()
+                .get(&scope)
+                .into_iter()
+                .flatten()
+                .any(|start| self.record_at(*start).is_some_and(|(had, ..)| had == name)),
+        }
     }
 
     pub fn in_scope(&self, scope: u64) -> Vec<Entry> {
-        self.scoped
-            .get(&scope)
+        self.words(scope)
             .into_iter()
-            .flatten()
             .filter(|(name, _)| !name.starts_with(MARKER))
             .map(|(name, (rank, last))| Entry {
-                name: name.clone(),
+                name,
                 kind: Kind::External,
-                rank: *rank,
-                last: *last,
+                rank,
+                last,
             })
             .collect()
     }
@@ -433,10 +524,28 @@ impl Store {
     }
 
     fn scoped_len(&self) -> usize {
-        self.scoped.values().map(HashMap::len).sum()
+        let untouched: usize = self
+            .index()
+            .iter()
+            .filter(|(scope, _)| !self.scoped.contains_key(scope))
+            .map(|(_, starts)| starts.len())
+            .sum();
+        untouched + self.scoped.values().map(HashMap::len).sum::<usize>()
+    }
+
+    /// Everything into memory. Only for the three callers that have to see every
+    /// scope at once, all of which are already rewriting the whole table.
+    fn materialise(&mut self) {
+        let scopes: Vec<u64> = self.index().keys().copied().collect();
+        for scope in scopes {
+            self.open_scope(scope);
+        }
+        self.raw = Vec::new();
+        self.index.take();
     }
 
     pub fn forget(&mut self, name: &str) -> bool {
+        self.materialise();
         let before = self.entries.len();
         self.entries.retain(|e| e.name != name);
         self.scoped.remove(&sub_scope(name));
@@ -454,6 +563,8 @@ impl Store {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.scoped.clear();
+        self.raw = Vec::new();
+        self.index.take();
         self.bindings.clear();
         self.ignored.clear();
         self.dirty = true;
@@ -505,7 +616,18 @@ impl Store {
             }),
         }
         if self.bindings.len() > MAX_BINDINGS {
-            self.bindings.sort_by_key(|b| std::cmp::Reverse(b.last));
+            // Weight before recency. Accepting and refusing corrections both
+            // leave rows here, so ordinary use fills the table on its own, and
+            // sorting on age alone drops a `bind` the user typed by hand ahead
+            // of five hundred rows nobody asked for. Losing a pin is worse than
+            // it sounds: the word does not stop resolving, it starts resolving
+            // somewhere else.
+            self.bindings.sort_by_key(|b| {
+                (
+                    std::cmp::Reverse(b.weight >= PINNED),
+                    std::cmp::Reverse(b.last),
+                )
+            });
             self.bindings.truncate(MAX_BINDINGS);
         }
     }
@@ -529,6 +651,7 @@ impl Store {
     }
 
     fn evict_scoped(&mut self) {
+        self.materialise();
         let at = now();
         let mut scored: Vec<_> = self
             .scoped
@@ -586,7 +709,7 @@ impl Store {
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(32 * self.entries.len() + 1024);
+        let mut out = Vec::with_capacity(32 * self.entries.len() + self.raw.len() + 1024);
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&FORMAT.to_le_bytes());
 
@@ -599,6 +722,22 @@ impl Store {
         }
 
         put_u32(&mut out, self.scoped_len());
+        // Copied, not re-encoded: a scope nobody read is still exactly the bytes
+        // it arrived as, and rebuilding it would undo the point of not decoding.
+        for (scope, starts) in self.index() {
+            if self.scoped.contains_key(scope) {
+                continue;
+            }
+            for start in starts {
+                let at = *start as usize;
+                let len = u16::from_le_bytes(
+                    self.raw[at + 8..at + 10]
+                        .try_into()
+                        .expect("indexed record"),
+                ) as usize;
+                out.extend_from_slice(&self.raw[at..at + 10 + len + 12]);
+            }
+        }
         for (scope, words) in &self.scoped {
             for (name, (rank, last)) in words {
                 out.extend_from_slice(&scope.to_le_bytes());
@@ -729,17 +868,17 @@ fn decode(bytes: &[u8]) -> Field<Store> {
         });
     }
 
-    for _ in 0..reader.count()? {
-        let scope = reader.u64()?;
-        let name = reader.string()?;
-        let rank = reader.f32()?;
-        let last = reader.u64()?;
-        store
-            .scoped
-            .entry(scope)
-            .or_default()
-            .insert(name, (rank, last));
+    // Stepped over rather than read. `Store::index` walks it again on the first
+    // question anyone asks of it, and most runs ask about one scope.
+    let scoped_count = reader.count()?;
+    let scoped_from = reader.at;
+    for _ in 0..scoped_count {
+        let _scope = reader.u64()?;
+        let len = reader.u16()? as usize;
+        reader.take(len)?;
+        reader.take(12)?;
     }
+    store.raw = bytes[scoped_from..reader.at].to_vec();
 
     for _ in 0..reader.count()? {
         store.bindings.push(Binding {
@@ -821,6 +960,26 @@ mod tests {
     }
 
     #[test]
+    fn a_pin_outlives_the_churn_that_fills_the_table() {
+        let mut store = Store::default();
+        store.nudge_binding("gs", "git", PINNED);
+        // Every accepted and every refused correction leaves a row here, so
+        // ordinary use fills the table without anyone asking it to.
+        for i in 0..MAX_BINDINGS + 8 {
+            store.nudge_binding(&format!("churn{i}"), "git", 1);
+        }
+        for binding in &mut store.bindings {
+            if binding.input == "gs" {
+                binding.last = 1;
+            }
+        }
+        store.nudge_binding("one-more", "git", 1);
+
+        assert_eq!(store.bindings.len(), MAX_BINDINGS);
+        assert_eq!(store.sticky("gs"), Some("git"), "the pin was evicted");
+    }
+
+    #[test]
     fn round_trips_every_table() {
         let path = scratch("roundtrip");
         let mut store = edit(&path);
@@ -843,6 +1002,60 @@ mod tests {
         assert_eq!(binding.unwrap().weight, 2);
         assert!(back.is_ignored("sl"));
         assert!(back.ranker(dir_key(Path::new("/tmp/project")), now())("make") > 0.0);
+    }
+
+    #[test]
+    fn a_scope_nobody_read_survives_a_write_that_touched_another() {
+        let path = scratch("lazy");
+        let mut store = edit(&path);
+        for dir in 0..40u64 {
+            for n in 0..5 {
+                store.bump_in(dir, &format!("cmd{dir}-{n}"), (n + 1) as f32);
+            }
+        }
+        store.bump_in(sub_scope("git"), "status", 3.0);
+        store.commit().unwrap();
+
+        // Reopened, so every scope is raw. Touch exactly one, write, reopen.
+        let mut again = edit(&path);
+        assert_eq!(again.in_scope(7).len(), 5);
+        again.bump_in(7, "cmd7-0", 10.0);
+        again.commit().unwrap();
+
+        let back = Store::open(&path);
+        for dir in 0..40u64 {
+            assert_eq!(back.in_scope(dir).len(), 5, "scope {dir} lost words");
+        }
+        assert!(back.scope_knows(sub_scope("git"), "status"));
+        assert_eq!(back.verbs("git").len(), 1);
+        let bumped = back
+            .in_scope(7)
+            .into_iter()
+            .find(|e| e.name == "cmd7-0")
+            .expect("cmd7-0");
+        assert_eq!(bumped.rank, 11.0);
+        assert!(back.ranker(7, now())("cmd7-0") > 0.0);
+        assert_eq!(back.ranker(9, now())("cmd7-0"), 0.0);
+    }
+
+    #[test]
+    fn forgetting_reaches_scopes_that_were_never_read() {
+        let path = scratch("lazyforget");
+        let mut store = edit(&path);
+        store.bump("make", Kind::External, 1.0);
+        store.bump_in(3, "make", 5.0);
+        store.bump_in(4, "make", 5.0);
+        store.bump_in(4, "cargo", 5.0);
+        store.commit().unwrap();
+
+        let mut again = edit(&path);
+        assert!(again.forget("make"));
+        again.commit().unwrap();
+
+        let back = Store::open(&path);
+        assert_eq!(back.ranker(3, now())("make"), 0.0);
+        assert_eq!(back.ranker(4, now())("make"), 0.0);
+        assert!(back.ranker(4, now())("cargo") > 0.0);
     }
 
     #[test]

@@ -47,9 +47,7 @@ pub fn inspect(command: &str, args: &[String]) -> Option<Concern> {
         .or_else(|| match bare {
             "git" => git(args),
             "chmod" | "chown" | "chgrp" => permissions(args),
-            "kill" | "pkill" => (flag(args, &['9'], &["KILL", "-signal=KILL"])
-                || args.iter().any(|a| a == "-KILL"))
-            .then_some("sends SIGKILL"),
+            "kill" | "pkill" => kills_outright(args).then_some("sends SIGKILL"),
             "docker" | "podman" | "nerdctl" => containers(args),
             "kubectl" | "oc" => sub(args, "delete").then_some("deletes cluster resources"),
             "terraform" | "tofu" | "pulumi" => infra(args),
@@ -118,7 +116,12 @@ fn removes_something(args: &[String]) -> Option<&'static str> {
     args.iter()
         .take_while(|a| *a != "--")
         .filter(|a| !a.starts_with('-'))
-        .take(3)
+        // Six rather than three: a flag that takes a value leaves that value
+        // sitting where a subcommand would be, and `docker --context a --host b
+        // container rm x` used to run the whole budget out before reaching `rm`.
+        // The words this can match are a fixed list of destructive verbs, so
+        // reading further costs an occasional extra question and nothing worse.
+        .take(6)
         .find_map(|verb| match verb.as_str() {
             "rm" | "rmi" | "remove" | "delete" | "destroy" | "prune" | "uninstall" => {
                 Some("removes something")
@@ -247,6 +250,33 @@ fn sub(args: &[String], name: &str) -> bool {
 
 /// The whole cluster has to be flags before any letter counts, or the `f` in
 /// `-f build.log` reads as `--force`.
+/// SIGKILL under any of its spellings: `-9`, `-KILL`, `-SIGKILL`, `-s KILL`,
+/// `--signal KILL`, `--signal=KILL`. The value has to be read rather than the
+/// flag counted, or `kill -s TERM` would be treated the same as `kill -9`.
+fn kills_outright(args: &[String]) -> bool {
+    let mut expecting = false;
+    for arg in args.iter().take_while(|a| *a != "--") {
+        let named = if expecting {
+            expecting = false;
+            arg.as_str()
+        } else if arg == "-s" || arg == "--signal" {
+            expecting = true;
+            continue;
+        } else if let Some(value) = arg.strip_prefix("--signal=") {
+            value
+        } else if let Some(cluster) = arg.strip_prefix('-').filter(|rest| !rest.is_empty()) {
+            cluster
+        } else {
+            continue;
+        };
+        let named = named.strip_prefix("SIG").unwrap_or(named);
+        if named == "9" || named.eq_ignore_ascii_case("kill") {
+            return true;
+        }
+    }
+    false
+}
+
 fn flag(args: &[String], shorts: &[char], longs: &[&str]) -> bool {
     args.iter()
         .take_while(|a| *a != "--")
@@ -294,6 +324,26 @@ mod tests {
         assert!(concern("kubectl", "delete pod x").is_some());
         assert!(concern("psql", "-c DROP TABLE users").is_some());
         assert!(inspect("sh", &["-c".into(), "curl -fsSL https://x.sh | sh".into()]).is_some());
+    }
+
+    #[test]
+    fn sigkill_is_recognised_by_every_name_it_has() {
+        assert!(concern("kill", "-9 4321").is_some());
+        assert!(concern("kill", "-KILL 4321").is_some());
+        assert!(concern("kill", "-SIGKILL 4321").is_some());
+        assert!(concern("kill", "-s KILL 4321").is_some());
+        assert!(concern("pkill", "--signal KILL node").is_some());
+        assert!(concern("pkill", "--signal=SIGKILL node").is_some());
+        // A gentler signal is the process's own business.
+        assert!(concern("kill", "4321").is_none());
+        assert!(concern("kill", "-s TERM 4321").is_none());
+        assert!(concern("kill", "-15 4321").is_none());
+    }
+
+    #[test]
+    fn a_flag_that_takes_a_value_does_not_hide_the_verb() {
+        assert!(concern("docker", "--context work --host tcp://x container rm c").is_some());
+        assert!(concern("kubectl", "--namespace prod --context c delete pod x").is_some());
     }
 
     #[test]

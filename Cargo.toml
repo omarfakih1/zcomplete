@@ -1,6 +1,6 @@
 [package]
 name = "zcomplete"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.70"
 description = "Frecency-ranked command resolution for zsh, bash and fish"
@@ -14,7 +14,7 @@ categories = ["command-line-utilities"]
 libc = "0.2.189"
 
 [profile.release]
-opt-level = 3
+opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true

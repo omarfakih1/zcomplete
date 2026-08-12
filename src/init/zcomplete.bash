@@ -18,7 +18,10 @@ __zcomplete_is_builtin() {
 
 __zcomplete_record() {
     local __zc_exit=$?
-    local entry number line typed word kind fixed
+    local entry number line typed word kind jkind verb fixed globbing
+    # The user's IFS is theirs, but splitting the line on it would put half a
+    # path where a command name belongs.
+    local IFS=$' \t\n'
 
     # `history 1` gives "  512  git status". The event number is what stops a
     # prompt redraw from recording the same line twice.
@@ -33,18 +36,20 @@ __zcomplete_record() {
     line=${line#"${line%%[![:space:]]*}"}
     typed=$line
 
-    while :; do
-        set -- $line
-        word=${1:-}
-        case "$word" in
-            *=*|sudo|doas|command|builtin|nohup|exec|env|time|nice|stdbuf)
-                shift
-                line="$*"
-                [ -n "$line" ] || return $__zc_exit
-                ;;
+    # Split once, with globbing off. `set -- $line` on `ls *` otherwise hands
+    # back the directory's own files, and the second of them would be written
+    # down as a subcommand of ls.
+    case $- in *f*) globbing= ;; *) globbing=1; set -f ;; esac
+    set -- $line
+    [ -z "$globbing" ] || set +f
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            *=*|sudo|doas|command|builtin|nohup|exec|env|time|nice|stdbuf) shift ;;
             *) break ;;
         esac
     done
+    word=${1:-}
 
     case "$word" in
         ''|*/*) return $__zc_exit ;;
@@ -69,9 +74,35 @@ __zcomplete_record() {
 
     if declare -F "$word" >/dev/null 2>&1 || alias "$word" >/dev/null 2>&1 ||
         __zcomplete_is_builtin "$word"; then
-        kind=shell
+        kind=shell jkind=bash
     else
-        kind=auto
+        kind=auto jkind=x
+    fi
+
+    # Nothing to correct on a command that worked, so it is only counted, and
+    # an append costs no process where starting zcomplete costs two of them.
+    if [ "$__zc_exit" -eq 0 ]; then
+        shift
+        verb=
+        while [ $# -gt 0 ]; do
+            case $1 in
+                ''|-*|*[!-_A-Za-z0-9]*) shift ;;
+                *) verb=$1; break ;;
+            esac
+        done
+        case $typed in *[\|\&\;\(\)\`]*) verb= ;; esac
+        # A newline in $PWD would end the record early and let the rest of the
+        # directory's name pose as a second one. `2>/dev/null` goes first: a
+        # redirection that fails reports it on whatever stderr is at the time,
+        # so putting it after the append is too late to silence it.
+        printf '%s %s %s %s %s\n' "${EPOCHSECONDS:-0}" "$jkind" "$word" "$verb" "${PWD//$'\n'/?}" \
+            2>/dev/null >>"$__zcomplete_journal"
+        __zcomplete_since=$(( ${__zcomplete_since:-0} + 1 ))
+        if [ "$__zcomplete_since" -ge 200 ]; then
+            __zcomplete_since=0
+            command zcomplete flush 2>/dev/null
+        fi
+        return 0
     fi
 
     fixed=$(command zcomplete record --shell bash --kind "$kind" --status "$__zc_exit" -- "$typed")
@@ -120,11 +151,24 @@ command_not_found_handle() {
     return 127
 }
 
+__zcomplete_since=0
+__zcomplete_journal=${ZCOMPLETE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zcomplete}/journal.$$
+# Created 0600 here, once, because a redirect takes the shell's umask and the
+# per-command path must not fork to fix it afterwards.
+[ -e "$__zcomplete_journal" ] || ( umask 077; : >>"$__zcomplete_journal" ) 2>/dev/null
+
+# The history file is already loaded when the first prompt is drawn, so without
+# this the last command of the previous session is recorded as if it had just
+# been run here.
+__zcomplete_last_event=$(HISTTIMEFORMAT='' history 1 2>/dev/null)
+__zcomplete_last_event=${__zcomplete_last_event#"${__zcomplete_last_event%%[![:space:]]*}"}
+__zcomplete_last_event=${__zcomplete_last_event%%[![:digit:]]*}
+
 case "${PROMPT_COMMAND:-}" in
     *__zcomplete_record*) ;;
     *) PROMPT_COMMAND="__zcomplete_record${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
 esac
 
-complete -W 'init query stats import forget bind unbind ignore mode safe unsafe bypass on off doctor help --version' zcomplete
+complete -W 'init query stats import forget bind unbind ignore mode safe unsafe bypass on off flush doctor help --version' zcomplete
 
 true

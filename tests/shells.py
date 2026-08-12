@@ -11,6 +11,7 @@ Usage:  python3 tests/shells.py [zsh|bash|fish]...
 """
 
 import fcntl
+import json
 import os
 import pty
 import re
@@ -24,8 +25,25 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / "target" / "release"
 TIMEOUT = 6.0
+
+
+def target_dir():
+    """Where this checkout's build lands. `.cargo/config.toml` can move it, and
+    on macOS it usually should: a checkout under ~/Documents is synced to iCloud,
+    and cargo writes tens of thousands of files that have no business up there."""
+    found = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    if found.returncode == 0:
+        return Path(json.loads(found.stdout)["target_directory"])
+    return Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+
+
+BIN = target_dir() / "release"
 
 
 def watchdog(*_):
@@ -615,6 +633,56 @@ def data_arguments_do_not_become_subcommands(sc):
     assert sc.zcomplete("query", "grep", "alpa").returncode != 0
 
 
+def journalled(sc):
+    """Every (command, verb) the shell wrote down, straight out of the journal.
+
+    The threshold on learning a verb hides most of what the hook records, so the
+    file itself is the only place a wrong verb shows before it is too late.
+    """
+    seen = []
+    for path in sorted(sc.data.glob("journal.*")):
+        for line in path.read_text(errors="replace").splitlines():
+            fields = line.split(" ", 4)
+            if len(fields) == 5:
+                seen.append((fields[2], fields[3]))
+    return seen
+
+
+@check("the verb survives a prefix, a flag and a glob")
+def the_recorded_verb_is_the_first_bare_word(sc):
+    sc.mode("bypass")
+    sc.session.run("mkdir -p globbed")
+    sc.session.run("printf '' > globbed/alpha")
+    sc.session.run("printf '' > globbed/beta")
+    sc.session.run("printf 'alpha\\n' > words.txt")
+    # grep is the fixture because it never starts zcomplete: a run of the binary
+    # folds the journal away, and there would be nothing left to read.
+    sc.zcomplete("flush")
+    for line in (
+        "grep alpha words.txt",
+        "command grep alpha words.txt",
+        "env ZCOMPLETE_UNUSED=1 grep alpha words.txt",
+        "grep -c alpha words.txt",
+        "cd globbed",
+        "ls *",
+        "ls -1",
+        "cd ..",
+    ):
+        out, code = sc.session.run(line)
+        assert sc.ran(code), f"{line!r} failed, so it was never recorded:\n{out}"
+    seen = journalled(sc)
+    assert seen, "the shell recorded nothing at all"
+
+    # `command` and `env VAR=1` are not the command, and `-c` is not the verb.
+    assert [verb for name, verb in seen if name == "grep"] == ["alpha"] * 4, (
+        f"a prefix or a flag was read as the command: {seen}"
+    )
+    # `ls *` must record no verb, not whatever the glob happened to expand to.
+    assert [verb for name, verb in seen if name == "ls"] == ["", ""], (
+        f"a glob or a flag was read as a subcommand: {seen}"
+    )
+
+
 @check("u fixes the command and its subcommand at once")
 def both_words_can_be_fixed_together(sc):
     sc.mode("safe")
@@ -788,12 +856,14 @@ def main():
         failures += 1
         print(f"FAIL  eight shells writing at once lose nothing\n      {err}")
 
+    ran = 0
     for kind in wanted:
         exe = find_shell(kind)
         if not exe:
             note = " (needs bash 4+; macOS ships 3.2)" if kind == "bash" else ""
             print(f"\n{kind}: not available, skipping{note}")
             continue
+        ran += 1
         print(f"\n{kind}  ({exe})")
         for name, fn in checks:
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -817,6 +887,11 @@ def main():
                         pass
                     signal.alarm(0)
 
+    # A run that found no shell to drive has proved nothing, and saying so is
+    # the difference between a green CI job and a green CI job that is lying.
+    if not ran:
+        print("\nno shell was available to test")
+        return 1
     print("\nall shells passed" if not failures else f"\n{failures} failing check(s)")
     return 1 if failures else 0
 

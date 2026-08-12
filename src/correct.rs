@@ -205,7 +205,10 @@ fn verb_candidates(
     let mut hits = match pinned {
         Some(name) if !db_store.scope_knows(scope, name) => return None,
         Some(name) => vec![matcher::Hit::pinned(name, Kind::External)],
-        None => matcher::among(typed, &db_store.verbs(parent), &ctx),
+        None => {
+            let verbs = db_store.verbs(parent);
+            matcher::among(typed, verbs.iter().map(matcher::Candidate::from), &ctx)
+        }
     };
     if hits.is_empty() {
         return None;
@@ -357,7 +360,13 @@ fn decide(
     let db = store::db_path();
     // Read unlocked: holding the database across a prompt would queue every
     // other shell's hook behind one keypress. The increments re-open it locked.
-    let db_store = Store::open(&db);
+    let mut db_store = Store::open(&db);
+    // Read, not taken: a command typed a moment ago is exactly the one being
+    // corrected now, and waiting for a flush to notice it would be absurd. The
+    // lines stay where they are for whoever next holds the write lock.
+    for (text, at) in pending() {
+        apply(&mut db_store, &text, at);
+    }
     if !db_store.enabled() {
         return Ok(Outcome::Disabled);
     }
@@ -432,12 +441,14 @@ fn decide(
     let verb = also.filter(|_| and_verb && chosen == 0);
 
     let mut writing = store::edit(&db);
+    let folded = fold(&mut writing);
     remember(&mut writing, word, &target, dir, caller.borrowed);
     if let Some(verb) = &verb {
         writing.bump_in(store::sub_scope(&target), &verb.fixed, 1.0);
         writing.nudge_binding(&format!("{target} {}", verb.typed), &verb.fixed, 1);
     }
     writing.commit().map_err(at(&db))?;
+    discard(folded);
 
     Ok(Outcome::Run(Fixed {
         word: target,
@@ -471,25 +482,32 @@ fn candidates(word: &str, ctx: &Context, pinned: Option<&str>, keep: usize) -> V
 
     let only_guesses = hits.iter().all(matcher::Hit::is_speculative);
     if (hits.is_empty() || only_guesses) && pinned.is_none() {
-        let installed: Vec<store::Entry> =
-            shell::path_commands(|name| plausibly_installed(word, name))
-                .into_iter()
-                .map(|name| store::Entry {
+        // Scored straight off the cached listing: these are slices of one
+        // buffer, and only the few that survive are ever copied.
+        let mut found = matcher::among(
+            word,
+            shell::path_names(|name| plausibly_installed(word, name)).map(|name| {
+                matcher::Candidate {
                     name,
                     kind: Kind::External,
                     rank: 0.0,
                     last: 0,
-                })
-                .collect();
-        let mut found = matcher::among(word, &installed, ctx);
+                }
+            }),
+            ctx,
+        );
         found.retain(|hit| match hit.tier {
             matcher::Tier::Prefix => true,
             matcher::Tier::Typo => hit.distance <= 1,
             _ => false,
         });
         found.retain(|hit| !hits.iter().any(|known| known.name == hit.name));
-        found.truncate(MAX_CANDIDATES);
+        // Installed before cut, not after: the listing can name something that
+        // has since been removed, and a dead name must not take a live one's
+        // place. Bounded by the same `take` the store side uses.
+        found.truncate(PROBES);
         found.retain(|hit| shell::on_path(&hit.name));
+        found.truncate(MAX_CANDIDATES);
         hits.extend(found);
         matcher::sort(&mut hits);
     }
@@ -703,6 +721,214 @@ fn runnable(kind: Kind, name: &str, shell: Option<Shell>) -> bool {
     }
 }
 
+/// What the shell appends instead of starting us up, one line per command:
+///
+///     <seconds> <kind> <word> <verb> <directory>
+///
+/// Space separated with the one free-form field last, so a path with spaces in
+/// it still parses. Never an argument, only ever the first two words. One file
+/// per shell session, so a line has exactly one writer.
+/// Every journal, left where it is. The read paths want to see what has been
+/// typed without taking the write lock to find out.
+pub(crate) fn pending() -> Vec<(String, u64)> {
+    let dir = store::data_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_str().is_some_and(is_journal) {
+            if let Ok(part) = std::fs::read_to_string(entry.path()) {
+                found.push((part, written(&entry.path())));
+            }
+        }
+    }
+    found
+}
+
+/// When a journal was last appended to. fish has no clock builtin, so its lines
+/// carry no time of their own and lean on this instead: every line in one file
+/// is dated by its last write, which is at most one flush out.
+fn written(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(store::now, |since| since.as_secs())
+}
+
+fn is_journal(name: &str) -> bool {
+    name.starts_with("journal.") && !name.ends_with(".folding")
+}
+
+/// Every journal, taken. Only for a caller that holds the write lock and is
+/// about to save what it absorbed.
+///
+/// The files come back rather than going away. A journal unlinked before the
+/// database it fed has landed is a session's worth of counts lost to one power
+/// cut or one full disk, so `discard` gets them once `commit` has returned.
+#[must_use]
+pub(crate) fn fold(writing: &mut store::Editing) -> Vec<std::path::PathBuf> {
+    // Without the lock another process is rewriting the same file, and with
+    // corrections off `apply` would drop every line it read. Either way these
+    // are somebody else's to fold, and taking them would only lose them.
+    if !writing.locked() || !writing.enabled() {
+        return Vec::new();
+    }
+    let dir = store::data_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut taken = Vec::new();
+    let mut mine = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // Renamed before it is read: a shell appending at that moment opens the
+        // path afresh and writes to a new file, so nothing is read twice or lost
+        // beyond the single line already in flight. One left behind by a fold
+        // that died before its commit is finished here rather than orphaned.
+        let taking = if is_journal(name) {
+            let taking = dir.join(format!("{name}.folding"));
+            if std::fs::rename(entry.path(), &taking).is_err() {
+                continue;
+            }
+            taking
+        } else if name.starts_with("journal.") && name.ends_with(".folding") {
+            entry.path()
+        } else {
+            continue;
+        };
+        // Bytes, not text: one directory name that is not UTF-8 would otherwise
+        // throw away every other line in the file along with it.
+        let Ok(part) = std::fs::read(&taking) else {
+            continue;
+        };
+        taken.push((
+            String::from_utf8_lossy(&part).into_owned(),
+            written(&taking),
+        ));
+        mine.push(taking);
+    }
+    for (text, at) in taken {
+        // Past the cap this is a runaway rather than a session, so it is taken
+        // as far as the cap and the rest is set aside for the next fold.
+        // Dropping the tail would be discarding lines nobody has read, which is
+        // the whole thing this function is careful not to do.
+        let (head, rest) = split_at_limit(&text);
+        apply(writing, head, at);
+        if !rest.is_empty() {
+            spill(&dir, rest);
+        }
+    }
+    mine
+}
+
+/// The first `FOLD_LIMIT` lines, and whatever is left after them.
+fn split_at_limit(text: &str) -> (&str, &str) {
+    match text.match_indices('\n').nth(FOLD_LIMIT - 1) {
+        Some((end, _)) => text.split_at(end + 1),
+        None => (text, ""),
+    }
+}
+
+/// What one fold would not take, kept where the next one will find it.
+fn spill(dir: &std::path::Path, rest: &str) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join(format!("journal.rest.{}", std::process::id()));
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(rest.as_bytes()));
+}
+
+/// The journals a fold took, dropped now that what they said has been written.
+pub(crate) fn discard(folded: Vec<std::path::PathBuf>) {
+    for path in folded {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+pub(crate) fn apply(db_store: &mut Store, text: &str, unstamped: u64) {
+    if text.is_empty() || !db_store.enabled() {
+        return;
+    }
+
+    let ceiling = store::now();
+    // Two hundred lines of the same command should cost one PATH sweep and one
+    // `canonicalize`, not two hundred of each: without this a fold is a visible
+    // stutter every time the buffer fills.
+    let mut installed: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut real: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    for line in text.lines().take(FOLD_LIMIT) {
+        let mut field = line.splitn(5, ' ');
+        let (Some(stamp), Some(tag), Some(word), Some(verb), Some(dir)) = (
+            field.next(),
+            field.next(),
+            field.next(),
+            field.next(),
+            field.next(),
+        ) else {
+            continue;
+        };
+        // Clamped: a clock that was wrong when the line was written would
+        // otherwise leave a rank permanently multiplied by the within-the-hour
+        // bucket, and `last` only ever moves forward.
+        let at = match stamp.parse().unwrap_or(0) {
+            0 => unstamped,
+            stamped => stamped,
+        }
+        // `max(1)` on the ceiling too: a box whose clock is still at the epoch
+        // would otherwise hand `clamp` a range with its floor above its top.
+        .clamp(1, ceiling.max(1));
+        let kind = match Shell::parse(tag) {
+            Some(shell) => Kind::Shell(shell),
+            // Checked now rather than then: a tool uninstalled since is dropped,
+            // which is the answer `record` would have given at the time.
+            None if *installed
+                .entry(word.to_owned())
+                .or_insert_with(|| shell::on_path(word)) =>
+            {
+                Kind::External
+            }
+            None => continue,
+        };
+        if db_store.is_ignored(word) {
+            continue;
+        }
+        db_store.absorb(word, kind, 1.0, at);
+        // Canonical, because every other reader and writer of this table uses
+        // `current_dir`, and the shell's `$PWD` keeps the symlinks in.
+        let dir = real.entry(dir.to_owned()).or_insert_with(|| {
+            std::fs::canonicalize(dir).unwrap_or_else(|_| std::path::PathBuf::from(dir))
+        });
+        db_store.bump_in_at(store::dir_key(dir), word, 1.0, at);
+        if !verb.is_empty() && is_verb(verb) && verb.len() <= 24 && !dir.join(verb).exists() {
+            db_store.bump_in_at(store::sub_scope(word), verb, 1.0, at);
+        }
+    }
+}
+
+/// A shell that never mistypes anything would buffer for ever, so the hooks ask
+/// for this every so often. It writes nothing else.
+pub(crate) fn flush() -> Result<i32, Fail> {
+    let db = store::db_path();
+    let mut db_store = store::edit(&db);
+    let folded = fold(&mut db_store);
+    db_store.commit().map_err(at(&db))?;
+    discard(folded);
+    Ok(0)
+}
+
+/// Anything past this in one fold is a runaway rather than a shell session.
+const FOLD_LIMIT: usize = 20_000;
+
 pub(crate) fn record(args: &[String]) -> Result<i32, Fail> {
     let (flags, operands) = split_flags(args);
     reject_unknown(&flags, &["--shell", "--kind", "--status"])?;
@@ -724,6 +950,7 @@ pub(crate) fn record(args: &[String]) -> Result<i32, Fail> {
 
     let db = store::db_path();
     let mut db_store = store::edit(&db);
+    let folded = fold(&mut db_store);
     if !db_store.enabled() {
         return Ok(0);
     }
@@ -744,6 +971,7 @@ pub(crate) fn record(args: &[String]) -> Result<i32, Fail> {
         }
     }
     let saved = db_store.commit().map_err(at(&db))?;
+    discard(folded);
 
     // Only with the lock let go is it safe to ask a human anything.
     if status.is_some_and(|code| code != 0) {
@@ -757,6 +985,13 @@ pub(crate) fn record(args: &[String]) -> Result<i32, Fail> {
 
 pub(crate) fn query(args: &[String]) -> Result<i32, Fail> {
     let (flags, operands) = split_flags(args);
+    {
+        let db = store::db_path();
+        let mut writing = store::edit(&db);
+        let folded = fold(&mut writing);
+        writing.commit().map_err(at(&db))?;
+        discard(folded);
+    }
     let Some(word) = operands.last() else {
         fail!("query needs a word")
     };
@@ -801,11 +1036,11 @@ pub(crate) fn query(args: &[String]) -> Result<i32, Fail> {
     for hit in hits.iter().take(limit) {
         match scored {
             true => println!(
-                "{:<24} {:<9} {:>8.1} {:>8.1}",
+                "{:<24} {:<9} {:>8} {:>8}",
                 hit.name,
                 hit.tier.label(),
-                hit.score,
-                hit.rank
+                store::tenths(hit.score),
+                store::tenths(hit.rank)
             ),
             false => println!("{}", hit.name),
         }

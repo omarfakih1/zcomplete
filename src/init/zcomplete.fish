@@ -29,21 +29,85 @@ function __zcomplete_first_word
     end
 end
 
+set -g __zcomplete_since 0
+if set -q ZCOMPLETE_DATA_DIR; and test -n "$ZCOMPLETE_DATA_DIR"
+    set -g __zcomplete_journal $ZCOMPLETE_DATA_DIR/journal.$fish_pid
+else if set -q XDG_DATA_HOME; and test -n "$XDG_DATA_HOME"
+    set -g __zcomplete_journal $XDG_DATA_HOME/zcomplete/journal.$fish_pid
+else
+    set -g __zcomplete_journal $HOME/.local/share/zcomplete/journal.$fish_pid
+end
+# Created 0600 here, once, because a redirect takes the shell's umask and the
+# per-command path must not fork to fix it afterwards.
+if not test -e $__zcomplete_journal
+    # Through $argv, not interpolated into the command: a data directory with a
+    # space in it would otherwise be split and the file created somewhere else.
+    fish -c 'umask 077; touch -- $argv[1]' -- $__zcomplete_journal 2>/dev/null
+end
+
 function __zcomplete_record --on-event fish_postexec
     set -l ret $status
     # The rerun below is itself a command, and fish would announce it here.
+    # Cleared on the way past rather than after the eval: a ctrl-c during the
+    # rerun never reaches the line that clears it, and a guard left standing
+    # would silence the hook for the rest of the session.
     if set -q __zcomplete_rerunning
+        set -e __zcomplete_rerunning
         return
     end
-    set -l word (__zcomplete_first_word $argv[1])
+    # Split once, inline: a command substitution is the most expensive thing
+    # left on this path, and calling out for the first word and again for the
+    # second paid for two.
+    set -l words (string split -n ' ' -- $argv[1])
+    while set -q words[1]
+        switch $words[1]
+            case '*=*' sudo doas command builtin nohup exec env time nice stdbuf
+                set -e words[1]
+            case '*'
+                break
+        end
+    end
+    set -l word $words[1]
     test -n "$word"; or return
     if string match -q -- '*/*' $word
         return
     end
 
     set -l kind auto
+    set -l jkind x
     if functions -q -- $word; or contains -- $word $__zcomplete_builtins
         set kind shell
+        set jkind fish
+    end
+
+    # A command that worked needs no correction, so all that is left is counting
+    # it, and an append costs no process where starting zcomplete costs one.
+    # fish has no clock builtin and `date` is a process, so the time is left at
+    # 0 and the fold dates the line by the journal's own mtime instead.
+    if test $ret -eq 0
+        set -l verb ''
+        for candidate in $words[2..-1]
+            if string match -qr '^[A-Za-z0-9_][-_A-Za-z0-9]*$' -- $candidate
+                set verb $candidate
+                break
+            end
+        end
+        if string match -qr '[|&;()`]' -- $argv[1]
+            set verb ''
+        end
+        # A newline in $PWD would end the record early and let the rest of the
+        # directory's name pose as a second one, so such a directory goes
+        # uncounted. `2>/dev/null` goes first: a redirection that fails reports
+        # it on whatever stderr is at the time.
+        if not string match -qr \n -- $PWD
+            echo "0 $jkind $word $verb $PWD" 2>/dev/null >>$__zcomplete_journal
+        end
+        set -g __zcomplete_since (math $__zcomplete_since + 1)
+        if test $__zcomplete_since -ge 200
+            set -g __zcomplete_since 0
+            command zcomplete flush 2>/dev/null
+        end
+        return
     end
 
     set -l fixed (command zcomplete record --shell fish --kind $kind --status $ret -- $argv[1] | string collect)
@@ -83,11 +147,33 @@ end
 # history, and a user's own binding survives. Enter is CR from a terminal
 # and LF from anything feeding fish through a pty.
 function __zcomplete_bind_enter --argument-names mode key
-    set -l existing (bind -M $mode $key 2>/dev/null | string replace -r '^bind\s+(--preset\s+)?\S+\s+' '')
-    if test -z "$existing"; or string match -q '*__zcomplete_rewrite*' -- "$existing"
-        set existing execute
+    # fish prints the preset binding first and any binding of the user's own
+    # after it, so the last line is the one in force. The flags between `bind`
+    # and the key have to be stepped over rather than assumed away: under vi
+    # keys the preset reads `bind --preset -m insert enter execute`, and taking
+    # the first word after `--preset` would leave `insert enter execute` as the
+    # command. `-m` also has to be carried over, since it is what makes enter
+    # leave normal mode.
+    set -l lines (bind -M $mode $key 2>/dev/null)
+    set -l command
+    set -l sets
+    if set -q lines[-1]
+        set command (string replace -r \
+            '^bind\s+(?:(?:--preset|-s|--silent)\s+|(?:-M|--mode|-m|--sets-mode|-k|--key)\s+\S+\s+)*\S+\s+' \
+            '' -- $lines[-1])
+        set sets (string match -r '(?:^|\s)(?:-m|--sets-mode)\s+(\S+)' -- $lines[-1])
+        # `bind` quotes a command that needs it, and passing those quotes back
+        # would bind the quoted string rather than what it stands for.
+        set command (string unescape --style=script -- $command)
     end
-    bind -M $mode $key __zcomplete_rewrite $existing
+    if test -z "$command"; or string match -q '*__zcomplete_rewrite*' -- "$command"
+        set command execute
+    end
+    if set -q sets[2]
+        bind -M $mode -m $sets[2] $key __zcomplete_rewrite $command
+    else
+        bind -M $mode $key __zcomplete_rewrite $command
+    end
 end
 
 for key in \r \n
@@ -121,4 +207,7 @@ complete -c zcomplete -n __fish_use_subcommand -a mode -d 'show the confirmation
 complete -c zcomplete -n __fish_use_subcommand -a safe -d 'confirm every correction'
 complete -c zcomplete -n __fish_use_subcommand -a unsafe -d 'confirm only dangerous corrections'
 complete -c zcomplete -n __fish_use_subcommand -a bypass -d 'never confirm'
+complete -c zcomplete -n __fish_use_subcommand -a on -d 'enable corrections'
+complete -c zcomplete -n __fish_use_subcommand -a off -d 'disable corrections'
+complete -c zcomplete -n __fish_use_subcommand -a flush -d 'fold what the shells have buffered'
 complete -c zcomplete -n __fish_use_subcommand -a doctor -d 'check the installation'

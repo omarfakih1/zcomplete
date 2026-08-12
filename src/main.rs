@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use std::os::unix::fs::DirBuilderExt;
+
 use store::Shell;
 
 macro_rules! fail {
@@ -76,6 +78,7 @@ fn run(args: &[String]) -> Result<i32, Fail> {
         "resolve" => correct::resolve(rest),
         "retry" => correct::retry(rest),
         "record" => correct::record(rest),
+        "flush" => correct::flush(),
         "query" => correct::query(rest),
         "stats" | "list" => admin::stats(rest),
         "import" => admin::import(rest),
@@ -149,6 +152,12 @@ fn init(args: &[String]) -> Result<i32, Fail> {
     let Some(shell) = Shell::parse(name) else {
         fail!("unsupported shell '{name}' (zsh, bash and fish are supported)")
     };
+    // The hook appends to this directory from the first command onward, and a
+    // redirect cannot create it. This runs once per shell, before any of that.
+    let _ = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(store::data_dir());
     print!("{}", shell::init_script(shell));
     Ok(0)
 }

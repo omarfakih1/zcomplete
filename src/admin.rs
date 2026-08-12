@@ -13,7 +13,13 @@ pub(crate) fn stats(args: &[String]) -> Result<i32, Fail> {
         .and_then(|n| n.parse().ok())
         .unwrap_or(25);
 
-    let db_store = Store::open(&store::db_path());
+    // Folded first: what a person asked to see should be what has happened, not
+    // what has happened minus whatever this shell has not flushed yet.
+    let db = store::db_path();
+    let mut writing = store::edit(&db);
+    let folded = crate::correct::fold(&mut writing);
+    let db_store = writing.commit().map_err(at(&db))?;
+    crate::correct::discard(folded);
     let at = store::now();
 
     if let Some(parent) = operands.first() {
@@ -32,8 +38,8 @@ pub(crate) fn stats(args: &[String]) -> Result<i32, Fail> {
         println!("{:>8}  {:<14} {}", "score", "last used", parent);
         for entry in ranked.iter().take(limit) {
             println!(
-                "{:>8.1}  {:<14} {parent} {}",
-                store::frecency(entry.rank, entry.last, at),
+                "{:>8}  {:<14} {parent} {}",
+                store::tenths(store::frecency(entry.rank, entry.last, at)),
                 ago(at.saturating_sub(entry.last)),
                 entry.name
             );
@@ -60,7 +66,8 @@ pub(crate) fn stats(args: &[String]) -> Result<i32, Fail> {
             Kind::Shell(shell) => format!(" ({})", shell.name()),
         };
         println!(
-            "{score:>8.1}  {:<14} {}{kind}",
+            "{:>8}  {:<14} {}{kind}",
+            store::tenths(*score),
             ago(at.saturating_sub(entry.last)),
             entry.name
         );
@@ -186,9 +193,19 @@ fn absorb(
 pub(crate) fn forget(args: &[String]) -> Result<i32, Fail> {
     let db = store::db_path();
     let mut db_store = store::edit(&db);
+    // Buffered lines first, or a shell that has been counting `rm` all morning
+    // puts it back at its next flush and the forget looks like it never happened.
+    let folded = crate::correct::fold(&mut db_store);
+    // On its own, never alongside names: `forget git --all` reads as a careless
+    // way of saying `forget git`, and emptying the database on it is not a
+    // mistake anyone gets to take back.
     if args.iter().any(|a| a == "--all") {
+        if args.len() > 1 {
+            fail!("--all empties the database, so it takes no command names")
+        }
         db_store.clear();
         db_store.commit().map_err(at(&db))?;
+        crate::correct::discard(folded);
         println!("database emptied");
         return Ok(0);
     }
@@ -203,6 +220,7 @@ pub(crate) fn forget(args: &[String]) -> Result<i32, Fail> {
         }
     }
     db_store.commit().map_err(at(&db))?;
+    crate::correct::discard(folded);
     Ok(0)
 }
 
@@ -286,6 +304,14 @@ pub(crate) fn mode(args: &[String]) -> Result<i32, Fail> {
     db_store.set_mode(mode);
     db_store.commit().map_err(at(&db))?;
     println!("{mode} - {}", mode.describe());
+    // The environment wins over the database, so saying nothing here would be
+    // reporting a change that no shell carrying this variable will act on.
+    if let Some(forced) = std::env::var_os("ZCOMPLETE_MODE") {
+        println!(
+            "note: ZCOMPLETE_MODE={} overrides this wherever it is exported",
+            forced.to_string_lossy()
+        );
+    }
     Ok(0)
 }
 

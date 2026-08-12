@@ -106,11 +106,36 @@ impl<'a> Context<'a> {
     }
 }
 
-pub fn rank(query: &str, ctx: &Context) -> Vec<Hit> {
-    among(query, &ctx.store.entries, ctx)
+/// A thing worth scoring, borrowed. The names off `PATH` are slices of one
+/// cached buffer, and wrapping each in an owned `Entry` to score it cost more
+/// than the scoring did.
+pub struct Candidate<'a> {
+    pub name: &'a str,
+    pub kind: Kind,
+    pub rank: f32,
+    pub last: u64,
 }
 
-pub fn among(query: &str, entries: &[Entry], ctx: &Context) -> Vec<Hit> {
+impl<'a> From<&'a Entry> for Candidate<'a> {
+    fn from(entry: &'a Entry) -> Candidate<'a> {
+        Candidate {
+            name: &entry.name,
+            kind: entry.kind,
+            rank: entry.rank,
+            last: entry.last,
+        }
+    }
+}
+
+pub fn rank(query: &str, ctx: &Context) -> Vec<Hit> {
+    among(query, ctx.store.entries.iter().map(Candidate::from), ctx)
+}
+
+pub fn among<'a>(
+    query: &str,
+    entries: impl Iterator<Item = Candidate<'a>>,
+    ctx: &Context,
+) -> Vec<Hit> {
     let query = lower(query);
     let key = ctx.learned_as(&query);
     let learned: Vec<&Binding> = ctx
@@ -124,28 +149,28 @@ pub fn among(query: &str, entries: &[Entry], ctx: &Context) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
 
     for entry in entries {
-        if entry.name.as_str() == query.as_ref() || !entry.kind.usable_in(ctx.shell) {
+        if entry.name == query.as_ref() || !entry.kind.usable_in(ctx.shell) {
             continue;
         }
-        if ignored && ctx.under.is_none() && ctx.store.is_ignored(&entry.name) {
+        if ignored && ctx.under.is_none() && ctx.store.is_ignored(entry.name) {
             continue;
         }
         let said = learned.iter().find(|b| b.target == entry.name);
         if said.is_some_and(|b| b.weight <= crate::store::BURIED_AT) {
             continue;
         }
-        let Some((tier, similarity, distance)) = classify(&query, &entry.name) else {
+        let Some((tier, similarity, distance)) = classify(&query, entry.name) else {
             continue;
         };
 
         let mut base = frecency(entry.rank, entry.last, ctx.now);
         if ctx.under.is_none() {
-            base += CONTEXT_WEIGHT * here(&entry.name);
+            base += CONTEXT_WEIGHT * here(entry.name);
         }
         let confirmed = said.map_or(0, |b| b.weight.clamp(0, 8)) as f32;
 
         hits.push(Hit {
-            name: entry.name.clone(),
+            name: entry.name.to_owned(),
             kind: entry.kind,
             tier,
             // Two edits away is a different word, or twelve uses of `chmod` beat the
@@ -155,7 +180,7 @@ pub fn among(query: &str, entries: &[Entry], ctx: &Context) -> Vec<Hit> {
             speculative: tier == Tier::Typo
                 && (distance > 1
                     || (entry.name.chars().count() != query.chars().count()
-                        && !stutter(&query, &lower(&entry.name)))),
+                        && !stutter(&query, &lower(entry.name)))),
             // Logarithmic on purpose: multiplied in directly, a much-used command wins
             // from far away; left out, an unused binary wins on spelling alone.
             score: (1.0 + base.max(0.0).ln_1p()) * similarity * (1.0 + 0.5 * confirmed),

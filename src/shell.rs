@@ -2,6 +2,7 @@
 //! another program or reads a file it did not write.
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -39,13 +40,13 @@ pub fn on_path(name: &str) -> bool {
     if name.is_empty() || name.contains('/') {
         return false;
     }
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 4096];
     path_dirs()
         .iter()
         .any(|dir| is_program(&mut buf, dir, name.as_bytes()))
 }
 
-fn is_program(buf: &mut [u8; 1024], dir: &[u8], name: &[u8]) -> bool {
+fn is_program(buf: &mut [u8; 4096], dir: &[u8], name: &[u8]) -> bool {
     // A C string ends at the first NUL, so `ls\0junk` would be stat'd as `ls`
     // and reported installed. `fs::metadata`, which this replaced, refused it.
     let end = dir.len() + 1 + name.len();
@@ -62,43 +63,205 @@ fn is_program(buf: &mut [u8; 1024], dir: &[u8], name: &[u8]) -> bool {
     found && info.st_mode & libc::S_IFMT == libc::S_IFREG && info.st_mode & 0o111 != 0
 }
 
-pub fn path_commands(wanted: impl Fn(&str) -> bool) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut path = [0u8; 1024];
+/// Sorted and deduplicated already: that was done once, when the listing was
+/// built, rather than on every miss for a set that has not changed since.
+pub fn path_names(wanted: impl Fn(&str) -> bool) -> impl Iterator<Item = &'static str> {
+    listing()
+        .split(|byte| *byte == 0)
+        .filter_map(|name| std::str::from_utf8(name).ok())
+        .filter(move |name| !name.is_empty() && wanted(name))
+}
+
+/// Every name on PATH, NUL separated, from the cache when the directories are
+/// as they were and from a sweep otherwise. Reading every directory is by far
+/// the slowest thing zcomplete does, and it is all wasted when nothing changed.
+fn listing() -> &'static [u8] {
+    static NAMES: OnceLock<Vec<u8>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        // Named for the directory list and validated by their metadata. Named
+        // for both and every install would orphan a file: a venv, a nix-shell
+        // and the login shell each want their own, and each wants it reused.
+        let cache = crate::store::db_path().with_file_name(format!("path.{:016x}", path_key()));
+        let (stamp, settled) = path_stamp();
+        if let Some(names) = fs::read(&cache).ok().and_then(|blob| {
+            // The stamp's own length comes last. A directory deleted off PATH
+            // since the sweep makes the new stamp shorter, and comparing it as
+            // a bare suffix would then be reading part of the old one.
+            let end = blob.len().checked_sub(8)?;
+            let mut len = [0u8; 8];
+            len.copy_from_slice(blob.get(end..)?);
+            let split = end.checked_sub(usize::try_from(u64::from_le_bytes(len)).ok()?)?;
+            (blob.get(split..end)? == stamp).then(|| blob[..split].to_vec())
+        }) {
+            return names;
+        }
+
+        let (mut names, whole) = sweep();
+        names = ordered(names);
+        // Not written when a directory would not open, or one EMFILE would be
+        // cached as the truth until something happened to change an mtime; nor
+        // when a directory changed this second, because on a filesystem that
+        // keeps mtimes to the second an install landing right after this sweep
+        // would leave a stamp we cannot tell from the one we just took.
+        // Unlocked on purpose: two shells that scan at once write the same
+        // bytes, and rename decides which copy survives.
+        if whole && settled && names.len() <= MAX_LISTING {
+            let mut blob = names.clone();
+            blob.extend_from_slice(&stamp);
+            blob.extend_from_slice(&(stamp.len() as u64).to_le_bytes());
+            let temp = cache.with_extension(format!("tmp.{}", std::process::id()));
+            let written = fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(cache.parent().unwrap_or(&cache))
+                .and_then(|()| {
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&temp)?
+                        .write_all(&blob)
+                })
+                .and_then(|()| fs::rename(&temp, &cache));
+            if written.is_err() {
+                let _ = fs::remove_file(&temp);
+            }
+        }
+        names
+    })
+}
+
+const MAX_LISTING: usize = 4 << 20;
+
+fn path_key() -> u64 {
+    let mut key: u64 = 0xcbf2_9ce4_8422_2325;
+    for dir in path_dirs() {
+        for byte in dir.iter().chain(b"\0") {
+            key ^= u64::from(*byte);
+            key = key.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    key
+}
+
+/// What the cache is checked against: one `stat` per directory rather than one
+/// `readdir` per entry, so it costs the same on a PATH with ten thousand
+/// programs as on one with ten. Installing anything moves its directory's mtime,
+/// and swapping a profile symlink moves the inode, which is what makes this
+/// sound where mtimes are normalised to a constant.
+///
+/// The second return says every directory is old enough that a change to one
+/// would show: a stamp taken in the same second as the change it is meant to
+/// notice cannot be trusted to differ from the next one.
+fn path_stamp() -> (Vec<u8>, bool) {
+    let mut stamp = Vec::with_capacity(path_dirs().len() * 32);
+    let mut settled = true;
+    let now = crate::store::now() as i64;
+    let mut path = [0u8; 4096];
     for dir in path_dirs() {
         if dir.len() >= path.len() {
             continue;
         }
         path[..dir.len()].copy_from_slice(dir);
         path[dir.len()] = 0;
+        let mut info = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::stat(path.as_ptr().cast(), &mut info) } != 0 {
+            continue;
+        }
+        settled &= now.saturating_sub(info.st_mtime) >= 1;
+        stamp.extend_from_slice(&info.st_mtime.to_le_bytes());
+        stamp.extend_from_slice(&info.st_mtime_nsec.to_le_bytes());
+        stamp.extend_from_slice(&info.st_size.to_le_bytes());
+        stamp.extend_from_slice(&info.st_ino.to_le_bytes());
+    }
+    (stamp, settled)
+}
+
+/// Sorted and deduplicated once, so the two directories that both hold `python3`
+/// cost one name here rather than a sort on every question asked of it.
+fn ordered(blob: Vec<u8>) -> Vec<u8> {
+    let mut names: Vec<&[u8]> = blob
+        .split(|byte| *byte == 0)
+        .filter(|n| !n.is_empty())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut out = Vec::with_capacity(blob.len());
+    for name in names {
+        out.extend_from_slice(name);
+        out.push(0);
+    }
+    out
+}
+
+/// Where errno lives, on the platforms that name it. `None` elsewhere, which
+/// costs only the old behaviour of reading a failed `readdir` as the end.
+fn errno_slot() -> Option<*mut libc::c_int> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_vendor = "apple"))]
+    {
+        Some(unsafe { libc::__error() })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(unsafe { libc::__errno_location() })
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+fn sweep() -> (Vec<u8>, bool) {
+    let mut names = Vec::new();
+    let mut whole = true;
+    let mut path = [0u8; 4096];
+    for dir in path_dirs() {
+        if dir.len() >= path.len() {
+            whole = false;
+            continue;
+        }
+        path[..dir.len()].copy_from_slice(dir);
+        path[dir.len()] = 0;
         let handle = unsafe { libc::opendir(path.as_ptr().cast()) };
         if handle.is_null() {
+            // A directory on PATH that is not there at all is normal and says
+            // nothing; one that exists and would not open is a failure.
+            whole &= std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound;
             continue;
         }
         loop {
+            // Zeroed first: `readdir` returns NULL both at the end of a
+            // directory and on a failure, and errno is the only thing that
+            // tells them apart. A listing truncated by an error and then cached
+            // as complete would hide every program past it.
+            if let Some(errno) = errno_slot() {
+                unsafe { *errno = 0 };
+            }
             let entry = unsafe { libc::readdir(handle) };
             if entry.is_null() {
+                if let Some(errno) = errno_slot() {
+                    whole &= unsafe { *errno } == 0;
+                }
                 break;
             }
             // Through a raw pointer, never `&*entry`: a record is only `d_reclen`
             // bytes, so a reference would claim bytes past the last one in a buffer.
             let name =
                 unsafe { std::ffi::CStr::from_ptr(std::ptr::addr_of!((*entry).d_name).cast()) };
-            if let Ok(name) = name.to_str() {
-                if wanted(name) {
-                    names.push(name.to_owned());
-                }
+            let name = name.to_bytes();
+            if name != b"." && name != b".." {
+                names.extend_from_slice(name);
+                names.push(0);
             }
         }
         unsafe { libc::closedir(handle) };
     }
-    names.sort_unstable();
-    names.dedup();
-    names
+    (names, whole)
 }
 
 pub fn which(name: &str) -> Option<PathBuf> {
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 4096];
     path_dirs()
         .iter()
         .find(|dir| is_program(&mut buf, dir, name.as_bytes()))

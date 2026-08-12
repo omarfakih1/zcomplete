@@ -9,6 +9,9 @@ if (( $+functions[command_not_found_handler] )) && (( ! $+functions[__zcomplete_
     fi
 fi
 
+# Sets REPLY to the command and REPLY2 to its verb. The verb is the first bare
+# word after the command, not simply the second word: `sudo git status` is about
+# `status`, and taking word two there would teach git a subcommand called git.
 __zcomplete_first_word() {
     local -a words
     words=(${(z)1})
@@ -19,6 +22,16 @@ __zcomplete_first_word() {
         esac
     done
     REPLY=${words[1]:-}
+    REPLY2=
+    words=(${words[2,-1]})
+    while (( $#words )); do
+        case $words[1] in
+            -*|'') ;;
+            *[^A-Za-z0-9_-]*) ;;
+            *) REPLY2=$words[1]; break ;;
+        esac
+        words=(${words[2,-1]})
+    done
 }
 
 __zcomplete_preexec() {
@@ -34,14 +47,17 @@ __zcomplete_precmd() {
     __zcomplete_typed=
     [[ -n $line ]] || return $ret
 
-    local REPLY kind fixed
+    local REPLY REPLY2 kind jkind fixed
     __zcomplete_first_word "$line"
     [[ -n $REPLY && $REPLY != */* ]] || return $ret
 
     # The not-found hook ran in a fork, found an alias or a function there, and
     # handed it back rather than running it: a fork is exactly what cannot keep
     # what those do. Here we are the shell itself, so a `cd` in one sticks.
-    if (( ret == 5 )); then
+    # `whence` as well as the status: 5 is what the not-found hook returns for a
+    # correction only the real shell can run, but it is also just a number, and
+    # a command of the user's own that exits 5 must not be called missing.
+    if (( ret == 5 )) && ! whence -- "$REPLY" >/dev/null 2>&1; then
         fixed=$(\command zcomplete retry --shell zsh --only "$REPLY" -- "$line")
         if [[ -n $fixed ]]; then
             eval -- "$fixed"
@@ -54,9 +70,29 @@ __zcomplete_precmd() {
     # Not (( $+commands[...] )): subscripts there are arithmetic, so `git-lfs`
     # asks about "git minus lfs" and quietly answers no.
     if [[ -n ${aliases[$REPLY]+x}${functions[$REPLY]+x}${builtins[$REPLY]+x} ]]; then
-        kind=shell
+        kind=shell jkind=zsh
     else
-        kind=auto
+        kind=auto jkind=x
+    fi
+
+    # The command worked, so there is nothing to correct and nothing to ask:
+    # all that is left is counting it, and a line appended here costs no process
+    # at all where starting zcomplete costs two and a half milliseconds. The
+    # next run that takes the write lock folds these in.
+    if (( ret == 0 )); then
+        local verb=$REPLY2
+        # Anything that could hide a second command hides the verb too.
+        [[ $line == *[\|\&\;\(\)\`]* || $line == *$'\n'* ]] && verb=
+        # A newline in $PWD would end the record early and let the rest of the
+        # directory's name pose as a second one. Substituted, not skipped, and
+        # by the parameter expansion rather than a command: this path forks for
+        # nothing.
+        { print -r -- "${EPOCHSECONDS:-0} $jkind $REPLY $verb ${PWD//$'\n'/?}" >>$__zcomplete_journal } 2>/dev/null
+        if (( ++__zcomplete_since >= 200 )); then
+            __zcomplete_since=0
+            \command zcomplete flush 2>/dev/null
+        fi
+        return 0
     fi
 
     fixed=$(\command zcomplete record --shell zsh --kind $kind --status $ret -- "$line")
@@ -106,6 +142,15 @@ command_not_found_handler() {
     return 127
 }
 
+# A clock without a fork. Everything the recording half writes has to cost
+# nothing, and `date` would cost more than the process it replaces.
+zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
+typeset -g __zcomplete_since=0
+typeset -g __zcomplete_journal=${ZCOMPLETE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zcomplete}/journal.$$
+# Created 0600 here, once, because a redirect takes the shell's umask and the
+# per-command path must not fork to fix it afterwards.
+[[ -e $__zcomplete_journal ]] || ( umask 077; : >>$__zcomplete_journal ) 2>/dev/null
+
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec __zcomplete_preexec
 add-zsh-hook precmd __zcomplete_precmd
@@ -127,6 +172,7 @@ _zcomplete() {
         'bypass:never confirm'
         'on:enable corrections'
         'off:disable corrections'
+        'flush:fold what the shells have buffered'
         'doctor:check the installation'
     )
     if (( CURRENT == 2 )); then
