@@ -175,6 +175,13 @@ function __zcomplete_bind_enter --argument-names mode key
     if test -z "$command"; or string match -q '*__zcomplete_rewrite*' -- "$command"
         set command execute
     end
+    # A bare `execute` bound alongside another command goes dead on fish 3.x:
+    # `bind` installs it without complaint, but the key then fires nothing at
+    # all, not even the other command. `commandline -f execute` is the same
+    # action spelled as a normal command instead of that special-cased name.
+    if test "$command" = execute
+        set command 'commandline -f execute'
+    end
     if set -q sets[2]
         bind -M $mode -m $sets[2] $key __zcomplete_rewrite $command
     else
