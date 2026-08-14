@@ -103,10 +103,14 @@ class Session:
                 if query in text:
                     os.write(self.fd, reply.encode())
 
-    def expect(self, needle, timeout=TIMEOUT):
+    def expect(self, needle, timeout=TIMEOUT, since=0):
+        """Wait for `needle`, ignoring everything the session printed before
+        `since`. A check that answers a prompt has usually seen the same words
+        earlier while it was setting the database up, so it has to say where
+        its own evidence starts."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if needle in ANSI.sub("", self.buffer):
+            if needle in ANSI.sub("", self.buffer[since:]):
                 return True
             self.drain(0.05)
         return False
@@ -711,9 +715,11 @@ def both_words_can_be_fixed_together(sc):
     assert sc.session.expect("u: also stat"), sc.session.tail()
     answered = len(sc.session.buffer)
     sc.session.type("u")
-    sc.session.drain(0.8)
-    after = ANSI.sub("", sc.session.buffer[answered:])
-    assert "last used" in after, f"u did not fix both words:\n{after}"
+    # Waited for, not slept on: this is the slowest answer in the suite, since
+    # it commits the verb and then runs a `stats` that has a table to print.
+    assert sc.session.expect("last used", since=answered), (
+        f"u did not fix both words:\n{ANSI.sub('', sc.session.buffer[answered:])}"
+    )
 
 
 @check("y leaves the subcommand alone")
@@ -724,9 +730,9 @@ def the_command_can_be_fixed_on_its_own(sc):
     assert sc.session.expect("u: also stat"), sc.session.tail()
     answered = len(sc.session.buffer)
     sc.session.type("y")
-    sc.session.drain(0.8)
-    after = ANSI.sub("", sc.session.buffer[answered:])
-    assert "unknown command 'stat'" in after, f"y should have run zcomplete stat:\n{after}"
+    assert sc.session.expect("unknown command 'stat'", since=answered), (
+        f"y should have run zcomplete stat:\n{ANSI.sub('', sc.session.buffer[answered:])}"
+    )
 
 
 @check("a subcommand is only learned once it has worked")
