@@ -648,6 +648,26 @@ def journalled(sc):
     return seen
 
 
+@check("the journal stays private across a fold")
+def the_journal_is_never_world_readable(sc):
+    def modes():
+        found = sorted(sc.data.glob("journal.*"))
+        assert found, "the shell wrote no journal to check"
+        return {path.name: path.stat().st_mode & 0o777 for path in found}
+
+    # The shells make it 0600 themselves, before anything has folded it away.
+    for name, mode in modes().items():
+        assert mode == 0o600, f"{name} was made {mode:04o}, not 0600"
+    sc.mode("bypass")
+    # `flush` folds it away, and whatever makes the next one decides its mode.
+    # Left to a redirect it would be made at the user's umask, which is a list
+    # of every command the user ran, and where, that the machine can read.
+    sc.zcomplete("flush")
+    sc.session.run("mkdir -p private")
+    for name, mode in modes().items():
+        assert mode == 0o600, f"{name} came back {mode:04o} after a fold, not 0600"
+
+
 @check("the verb survives a prefix, a flag and a glob")
 def the_recorded_verb_is_the_first_bare_word(sc):
     sc.mode("bypass")

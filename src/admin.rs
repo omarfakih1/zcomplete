@@ -18,8 +18,7 @@ pub(crate) fn stats(args: &[String]) -> Result<i32, Fail> {
     let db = store::db_path();
     let mut writing = store::edit(&db);
     let folded = crate::correct::fold(&mut writing);
-    let db_store = writing.commit().map_err(at(&db))?;
-    crate::correct::discard(folded);
+    let db_store = writing.commit_taking(folded).map_err(at(&db))?;
     let at = store::now();
 
     if let Some(parent) = operands.first() {
@@ -204,8 +203,7 @@ pub(crate) fn forget(args: &[String]) -> Result<i32, Fail> {
             fail!("--all empties the database, so it takes no command names")
         }
         db_store.clear();
-        db_store.commit().map_err(at(&db))?;
-        crate::correct::discard(folded);
+        db_store.commit_taking(folded).map_err(at(&db))?;
         println!("database emptied");
         return Ok(0);
     }
@@ -219,8 +217,7 @@ pub(crate) fn forget(args: &[String]) -> Result<i32, Fail> {
             println!("{name} was not in the database");
         }
     }
-    db_store.commit().map_err(at(&db))?;
-    crate::correct::discard(folded);
+    db_store.commit_taking(folded).map_err(at(&db))?;
     Ok(0)
 }
 

@@ -224,6 +224,12 @@ fn worth_asking(db_store: &Store, parent: &str, typed: &str) -> bool {
         && is_verb(typed)
         && typed.chars().count() >= MIN_INPUT
         && shell::on_path(parent)
+        // `--help` is a question, not an instruction, but that is the command's
+        // word for it and not ours. For the handful whose ordinary use costs
+        // something you cannot get back, the subcommands are not worth finding
+        // out by running the thing. Everything else - `git`, `cargo`, `docker` -
+        // is still asked, which is what makes `git sttaus` work on day one.
+        && crate::safety::inspect(parent, &["--help".to_owned()]).is_none()
 }
 
 fn ask_for_verbs(db: &std::path::Path, parent: &str) -> Result<Store, Fail> {
@@ -447,8 +453,7 @@ fn decide(
         writing.bump_in(store::sub_scope(&target), &verb.fixed, 1.0);
         writing.nudge_binding(&format!("{target} {}", verb.typed), &verb.fixed, 1);
     }
-    writing.commit().map_err(at(&db))?;
-    discard(folded);
+    writing.commit_taking(folded).map_err(at(&db))?;
 
     Ok(Outcome::Run(Fixed {
         word: target,
@@ -759,7 +764,41 @@ fn written(path: &std::path::Path) -> u64 {
 }
 
 fn is_journal(name: &str) -> bool {
-    name.starts_with("journal.") && !name.ends_with(".folding")
+    name.starts_with("journal.") && folding_owner(name).is_none()
+}
+
+/// The pid in `journal.<session>.folding.<pid>`, for a name that is one.
+fn folding_owner(name: &str) -> Option<u32> {
+    let (head, pid) = name.rsplit_once('.')?;
+    (head.starts_with("journal.") && head.ends_with(".folding"))
+        .then(|| pid.parse().ok())
+        .flatten()
+}
+
+/// Whether a process still exists. Signal 0 asks without sending anything, and
+/// `EPERM` is somebody else's process rather than a free pid.
+fn alive(pid: u32) -> bool {
+    let answer = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    answer == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// An empty journal back at `name`, 0600, for the session still appending to
+/// it. Only while that session is alive: one belonging to a shell that has gone
+/// would be made again at every fold and never taken away.
+fn replace(dir: &std::path::Path, name: &str) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let owner = name.rsplit('.').next().and_then(|pid| pid.parse().ok());
+    if !owner.is_some_and(alive) {
+        return;
+    }
+    // `create_new`, so a shell that got its append in first keeps the file it
+    // made. That one is the wrong mode until the next fold, which is a window
+    // rather than the permanent state this exists to prevent.
+    let _ = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(dir.join(name));
 }
 
 /// Every journal, taken. Only for a caller that holds the write lock and is
@@ -770,10 +809,12 @@ fn is_journal(name: &str) -> bool {
 /// cut or one full disk, so `discard` gets them once `commit` has returned.
 #[must_use]
 pub(crate) fn fold(writing: &mut store::Editing) -> Vec<std::path::PathBuf> {
-    // Without the lock another process is rewriting the same file, and with
-    // corrections off `apply` would drop every line it read. Either way these
-    // are somebody else's to fold, and taking them would only lose them.
-    if !writing.locked() || !writing.enabled() {
+    // Without the lock another process is rewriting the same file; with
+    // corrections off `apply` would drop every line it read; and a database we
+    // are not allowed to write is one whose counts have nowhere to land. Either
+    // way these are somebody else's to fold, and taking them would only lose
+    // them.
+    if !writing.locked() || !writing.enabled() || writing.is_read_only() {
         return Vec::new();
     }
     let dir = store::data_dir();
@@ -792,12 +833,29 @@ pub(crate) fn fold(writing: &mut store::Editing) -> Vec<std::path::PathBuf> {
         // beyond the single line already in flight. One left behind by a fold
         // that died before its commit is finished here rather than orphaned.
         let taking = if is_journal(name) {
-            let taking = dir.join(format!("{name}.folding"));
+            // The name carries our pid, so a live journal can never be renamed
+            // onto one an earlier fold took and has not finished with. A fixed
+            // `.folding` meant the second fold destroyed the first fold's
+            // unread copy and then read the survivor twice.
+            let taking = dir.join(format!("{name}.folding.{}", std::process::id()));
             if std::fs::rename(entry.path(), &taking).is_err() {
                 continue;
             }
+            // An empty one put back in its place. The shells make the journal
+            // 0600 once, at startup, and only append to it afterwards, so a
+            // fold that leaves the name free hands the making of the next one
+            // to a redirect - and a redirect takes the user's umask. Every
+            // session that folded once was writing the list of every command
+            // it ran, and where, to a file the whole machine could read.
+            replace(&dir, name);
             taking
-        } else if name.starts_with("journal.") && name.ends_with(".folding") {
+        } else if let Some(owner) = folding_owner(name) {
+            // One left behind by a fold that died before its commit. Only once
+            // the process that took it is gone, or two folds running at the
+            // same time would both read it and count every line twice.
+            if owner == std::process::id() || alive(owner) {
+                continue;
+            }
             entry.path()
         } else {
             continue;
@@ -845,13 +903,6 @@ fn spill(dir: &std::path::Path, rest: &str) {
         .mode(0o600)
         .open(path)
         .and_then(|mut file| file.write_all(rest.as_bytes()));
-}
-
-/// The journals a fold took, dropped now that what they said has been written.
-pub(crate) fn discard(folded: Vec<std::path::PathBuf>) {
-    for path in folded {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 pub(crate) fn apply(db_store: &mut Store, text: &str, unstamped: u64) {
@@ -921,8 +972,7 @@ pub(crate) fn flush() -> Result<i32, Fail> {
     let db = store::db_path();
     let mut db_store = store::edit(&db);
     let folded = fold(&mut db_store);
-    db_store.commit().map_err(at(&db))?;
-    discard(folded);
+    db_store.commit_taking(folded).map_err(at(&db))?;
     Ok(0)
 }
 
@@ -970,8 +1020,7 @@ pub(crate) fn record(args: &[String]) -> Result<i32, Fail> {
             }
         }
     }
-    let saved = db_store.commit().map_err(at(&db))?;
-    discard(folded);
+    let saved = db_store.commit_taking(folded).map_err(at(&db))?;
 
     // Only with the lock let go is it safe to ask a human anything.
     if status.is_some_and(|code| code != 0) {
@@ -989,8 +1038,7 @@ pub(crate) fn query(args: &[String]) -> Result<i32, Fail> {
         let db = store::db_path();
         let mut writing = store::edit(&db);
         let folded = fold(&mut writing);
-        writing.commit().map_err(at(&db))?;
-        discard(folded);
+        writing.commit_taking(folded).map_err(at(&db))?;
     }
     let Some(word) = operands.last() else {
         fail!("query needs a word")
@@ -1070,6 +1118,21 @@ mod tests {
             "mygitfn",
             Some(Shell::Fish)
         ));
+    }
+
+    #[test]
+    fn a_command_that_costs_something_is_never_run_to_read_its_help() {
+        let store = Store::default();
+        // `sh` stands in for the ordinary case: on PATH, takes no verbs yet,
+        // and worth asking. `rm` and `sudo` are the same in every way except
+        // what running them by accident costs.
+        assert!(worth_asking(&store, "sh", "sttaus"));
+        for dangerous in ["rm", "sudo", "dd", "shutdown", "mkfs.ext4"] {
+            assert!(
+                !worth_asking(&store, dangerous, "sttaus"),
+                "{dangerous} --help would have been run"
+            );
+        }
     }
 
     #[test]

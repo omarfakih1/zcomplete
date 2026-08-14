@@ -284,7 +284,34 @@ impl Editing {
     }
 
     pub fn commit(mut self) -> io::Result<Store> {
+        // The lock we took is on an inode that is no longer at that name, so
+        // the directory went out from under us and somebody else is holding
+        // what is there now. Losing one run's counts beats overwriting a
+        // database that a process we cannot see is in the middle of writing.
+        if self.lock.as_ref().is_some_and(|lock| !lock.current()) {
+            self.lock = None;
+            return Ok(self.store);
+        }
         let result = self.store.write(&self.path);
+        self.lock = None;
+        result.map(|()| self.store)
+    }
+
+    /// Commit, then delete `taken` before the lock goes. Unlinking after the
+    /// lock was released let the next folder pick the same journals up and
+    /// apply them again, which is how an emptied database refilled itself.
+    /// Only after a write that landed: journals kept are counts kept.
+    pub fn commit_taking(mut self, taken: Vec<PathBuf>) -> io::Result<Store> {
+        if self.lock.as_ref().is_some_and(|lock| !lock.current()) {
+            self.lock = None;
+            return Ok(self.store);
+        }
+        let result = self.store.write(&self.path);
+        if result.is_ok() {
+            for path in taken {
+                let _ = fs::remove_file(path);
+            }
+        }
         self.lock = None;
         result.map(|()| self.store)
     }
@@ -304,22 +331,70 @@ impl std::ops::DerefMut for Editing {
     }
 }
 
+/// Move an unreadable database aside, to a name nothing else holds. One fixed
+/// `commands.corrupt` meant the second corruption renamed over the copy taken
+/// for the first, so the only intact database anyone still had was destroyed by
+/// the thing meant to be saving it.
+fn quarantine(path: &Path) -> Option<PathBuf> {
+    for attempt in 0..16 {
+        let kept = path.with_extension(match attempt {
+            0 => format!("corrupt.{}", now()),
+            n => format!("corrupt.{}.{n}", now()),
+        });
+        // Nothing is ever renamed onto: `link` fails outright if the name is
+        // taken, where `rename` would replace it without a word.
+        if fs::hard_link(path, &kept).is_ok() {
+            let _ = fs::remove_file(path);
+            return Some(kept);
+        }
+        if !kept.exists() {
+            return None;
+        }
+    }
+    None
+}
+
 impl Store {
     pub fn open(path: &Path) -> Store {
-        let Ok(bytes) = fs::read(path) else {
-            return Store::default();
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            // No database yet is the ordinary first run. Anything else - a
+            // permission, a dangling symlink, one EMFILE - is a database that
+            // exists and could not be read, and starting empty there would
+            // rewrite it as empty at the next commit. Nothing that could not be
+            // read is ever written over.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Store::default(),
+            Err(err) => return Store::unreadable(path, &err.to_string()),
         };
         match decode(&bytes) {
             Ok(store) => store,
-            Err(Broken::Garbled) => {
-                let _ = fs::rename(path, path.with_extension("corrupt"));
-                Store::default()
-            }
+            Err(Broken::Garbled) => match quarantine(path) {
+                Some(kept) => {
+                    eprintln!(
+                        "zcomplete: {} was unreadable, kept at {}",
+                        path.display(),
+                        kept.display()
+                    );
+                    Store::default()
+                }
+                // Could not be set aside, so it is not ours to overwrite.
+                None => Store::unreadable(path, "unreadable, and could not be set aside"),
+            },
             // A newer zcomplete wrote this; do not overwrite what we cannot read.
             Err(Broken::TooNew) => Store {
                 read_only: true,
                 ..Store::default()
             },
+        }
+    }
+
+    /// An empty store that refuses to be written. What the caller reads from it
+    /// is wrong, but wrong and recoverable beats right and destroyed.
+    fn unreadable(path: &Path, why: &str) -> Store {
+        eprintln!("zcomplete: {}: {why}, leaving it alone", path.display());
+        Store {
+            read_only: true,
+            ..Store::default()
         }
     }
 
@@ -546,15 +621,19 @@ impl Store {
 
     pub fn forget(&mut self, name: &str) -> bool {
         self.materialise();
-        let before = self.entries.len();
+        let before = (self.entries.len(), self.bindings.len());
         self.entries.retain(|e| e.name != name);
-        self.scoped.remove(&sub_scope(name));
+        let scoped = self.scoped.remove(&sub_scope(name)).is_some();
+        let mut dropped = scoped;
         for words in self.scoped.values_mut() {
-            words.remove(name);
+            dropped |= words.remove(name).is_some();
         }
         self.bindings.retain(|b| b.target != name);
-        self.dirty = true;
-        self.entries.len() != before
+        // Only when something went. `forget nosuchcommand` marking the store
+        // dirty rewrote the whole file to say nothing had changed.
+        let now = (self.entries.len(), self.bindings.len());
+        self.dirty |= dropped || now != before;
+        self.entries.len() != before.0
     }
 
     /// Bindings and the ignore list too: they are answers the database gives,
@@ -683,6 +762,10 @@ impl Store {
         if !self.dirty || self.read_only {
             return Ok(());
         }
+        // Still made here, because `flock` failing outright on a network mount
+        // leaves nobody else to make it. A run that started before an `rm -rf`
+        // of the data directory does not get this far: the stale lock check in
+        // `commit` sends it home before it can put the database back.
         if let Some(parent) = path.parent() {
             fs::DirBuilder::new()
                 .recursive(true)
@@ -910,7 +993,24 @@ fn decode(bytes: &[u8]) -> Field<Store> {
 /// Closing the file releases the lock, so there is no `Drop` of our own and
 /// nothing to unlink.
 struct Lock {
-    _file: fs::File,
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl Lock {
+    /// Whether the file we locked is still the file at that name. Deleting the
+    /// data directory unlinks the lock without releasing it: we keep an
+    /// exclusive lock on an inode nobody can reach, the next process creates a
+    /// fresh lock file and takes it uncontested, and both write believing
+    /// themselves alone. Whoever commits second replaces the other's database
+    /// wholesale.
+    fn current(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(ours) = self.file.metadata() else {
+            return false;
+        };
+        fs::metadata(&self.path).is_ok_and(|now| now.ino() == ours.ino() && now.dev() == ours.dev())
+    }
 }
 
 impl Lock {
@@ -943,7 +1043,7 @@ impl Lock {
             }
         };
         let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0;
-        held.then_some(Lock { _file: file })
+        held.then_some(Lock { file, path })
     }
 }
 
@@ -957,6 +1057,90 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir.join("db.bin")
+    }
+
+    #[test]
+    fn a_database_that_cannot_be_read_is_never_written_over() {
+        let path = scratch("unreadable");
+        let mut store = edit(&path);
+        store.bump("git", Kind::External, 1.0);
+        store.bump("cargo", Kind::External, 1.0);
+        store.nudge_binding("gs", "git", PINNED);
+        store.commit().unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(before.len() > 40, "nothing was written to begin with");
+
+        // Not missing: present, and unreadable. Starting empty here and saving
+        // that is how a database is destroyed by the run that could not read it.
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        let mut blind = edit(&path);
+        blind.bump("ls", Kind::External, 1.0);
+        blind.commit().unwrap();
+
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "the database was rewritten"
+        );
+        let back = Store::open(&path);
+        assert_eq!(back.entries.len(), 2);
+        assert_eq!(back.sticky("gs"), Some("git"));
+    }
+
+    #[test]
+    fn a_second_corruption_does_not_destroy_the_first_ones_copy() {
+        let path = scratch("quarantine");
+        let mut store = edit(&path);
+        store.bump("git", Kind::External, 1.0);
+        store.commit().unwrap();
+        // Truncated rather than replaced: what a half-written file looks like,
+        // and it is still most of the database somebody would want back.
+        let real = fs::read(&path).unwrap();
+        let hurt = real[..real.len() - 4].to_vec();
+        fs::write(&path, &hurt).unwrap();
+        assert!(Store::open(&path).entries.is_empty());
+
+        let mut second = edit(&path);
+        second.bump("ls", Kind::External, 1.0);
+        second.commit().unwrap();
+        let small = fs::read(&path).unwrap();
+        fs::write(&path, &small[..small.len() - 4]).unwrap();
+        assert!(Store::open(&path).entries.is_empty());
+
+        // Both corruptions kept a copy, and the first one still holds the real
+        // database. One fixed `commands.corrupt` had the second rename over it.
+        let dir = path.parent().unwrap();
+        let kept: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".corrupt"))
+            })
+            .collect();
+        assert_eq!(kept.len(), 2, "a quarantine was overwritten: {kept:?}");
+        assert!(
+            kept.iter().any(|p| fs::read(p).unwrap() == hurt),
+            "the first copy was destroyed by the second corruption"
+        );
+    }
+
+    #[test]
+    fn a_forget_that_found_nothing_writes_nothing() {
+        let path = scratch("noop-forget");
+        let mut store = edit(&path);
+        store.bump("git", Kind::External, 1.0);
+        store.commit().unwrap();
+
+        let mut store = edit(&path);
+        assert!(!store.forget("nosuchcommand"));
+        assert!(
+            !store.dirty,
+            "a forget that removed nothing marked it dirty"
+        );
     }
 
     #[test]
@@ -1129,7 +1313,12 @@ mod tests {
 
         let back = Store::open(&path);
         assert!(back.entries.is_empty());
-        assert!(path.with_extension("corrupt").exists());
+        let dir = path.parent().unwrap();
+        assert!(fs::read_dir(dir).unwrap().flatten().any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.contains(".corrupt"))
+        }));
     }
 
     #[test]

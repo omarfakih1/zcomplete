@@ -40,9 +40,15 @@ end
 # Created 0600 here, once, because a redirect takes the shell's umask and the
 # per-command path must not fork to fix it afterwards.
 if not test -e $__zcomplete_journal
-    # Through $argv, not interpolated into the command: a data directory with a
-    # space in it would otherwise be split and the file created somewhere else.
-    fish -c 'umask 077; touch -- $argv[1]' -- $__zcomplete_journal 2>/dev/null
+    # Set and put back, rather than forked into a `fish -c` subshell: that
+    # looked the shell up on PATH, and a fish whose own binary is not on PATH
+    # printed `Unknown command: fish` into the session and left the journal to
+    # be created by the first append instead - at the user's umask, which is
+    # usually 0644, on a file listing every command they run and where.
+    set -l __zcomplete_umask (umask)
+    umask 077
+    echo -n '' >>$__zcomplete_journal 2>/dev/null
+    umask $__zcomplete_umask
 end
 
 function __zcomplete_record --on-event fish_postexec

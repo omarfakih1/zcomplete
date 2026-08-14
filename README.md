@@ -347,11 +347,15 @@ reports the failure you typed even after the rerun succeeds.
 ## Uninstall
 
 ```bash
-zcomplete forget --all
-rm -rf ~/.local/share/zcomplete
+curl -fsSL https://raw.githubusercontent.com/omarfakih1/zcomplete/main/uninstall.sh | sh
 ```
 
-and delete the `zcomplete init` line from your shell config.
+It takes the lines back out of your shell config (keeping a `.zcomplete.bak`
+beside each), deletes the database, and removes the binary. `--keep-data` keeps
+what it learned. Shells you already have open keep the hook until you
+`exec $SHELL`.
+
+## Contributing
 
 `cargo test` covers none of [src/init/](src/init). Those are tested by driving a
 real zsh, bash and fish under a pty, which needs all three installed and takes
