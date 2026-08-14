@@ -175,11 +175,13 @@ function __zcomplete_bind_enter --argument-names mode key
     if test -z "$command"; or string match -q '*__zcomplete_rewrite*' -- "$command"
         set command execute
     end
-    # A bare `execute` bound alongside another command goes dead on fish 3.x:
+    # A bare `execute` bound after another command goes dead before fish 4:
     # `bind` installs it without complaint, but the key then fires nothing at
-    # all, not even the other command. `commandline -f execute` is the same
-    # action spelled as a normal command instead of that special-cased name.
-    if test "$command" = execute
+    # all, not even the command in front of it. Queueing it as `commandline -f
+    # execute` runs there, and only there: the queue is dropped when a command
+    # that took the terminal hands it back, which is every correction we make,
+    # so on a fish that runs the bare name inline it stays the bare name.
+    if test "$command" = execute; and string match -qr '^[0-3]\.' -- $FISH_VERSION
         set command 'commandline -f execute'
     end
     if set -q sets[2]
