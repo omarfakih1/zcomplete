@@ -79,7 +79,7 @@ One keypress, no Enter. `u` is for a line where both words are wrong:
 ```
 $ zcom he
 zcomplete: run zcomplete instead of 'zcom'?  u: also he -> help [Y/n] u
-zcomplete 0.1.1 - run the command you meant
+zcomplete 0.1.2 - run the command you meant
 ```
 
 `y` there would run `zcomplete he` and let it fail.
