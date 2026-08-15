@@ -345,6 +345,7 @@ fn quarantine(path: &Path) -> Option<PathBuf> {
         // taken, where `rename` would replace it without a word.
         if fs::hard_link(path, &kept).is_ok() {
             let _ = fs::remove_file(path);
+            reap_quarantined(path, &kept);
             return Some(kept);
         }
         if !kept.exists() {
@@ -352,6 +353,47 @@ fn quarantine(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// How many quarantined databases are worth keeping. The newest is the one
+/// anybody would look at; older ones are copies of a file that was already
+/// unreadable, and each is as big as the database was.
+const KEEP_QUARANTINED: usize = 2;
+
+/// Drops the oldest quarantined copies. Without this every corruption left a
+/// full-sized file in the data directory for good, and the only thing that ever
+/// removed one was the user noticing.
+fn reap_quarantined(path: &Path, keep: &Path) {
+    // The stem, not the whole name: `with_extension` replaced `commands.bin`'s
+    // extension, so the copies are `commands.corrupt.<when>`.
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let prefix = format!("{stem}.corrupt.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .filter(|entry| entry.path() != keep)
+        .filter_map(|entry| {
+            let at = entry.metadata().and_then(|meta| meta.modified()).ok()?;
+            Some((at, entry.path()))
+        })
+        .collect();
+    if found.len() < KEEP_QUARANTINED {
+        return;
+    }
+    found.sort_unstable_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (_, stale) in found.drain(KEEP_QUARANTINED - 1..) {
+        let _ = fs::remove_file(stale);
+    }
 }
 
 impl Store {
@@ -1125,6 +1167,34 @@ mod tests {
         assert!(
             kept.iter().any(|p| fs::read(p).unwrap() == hurt),
             "the first copy was destroyed by the second corruption"
+        );
+    }
+
+    #[test]
+    fn quarantined_copies_do_not_pile_up_forever() {
+        let path = scratch("quarantine-cap");
+        // Six corruptions in a row. Each one used to leave a full-sized copy of
+        // the database behind with nothing to ever remove it.
+        for round in 0..6 {
+            let mut store = edit(&path);
+            store.bump("git", Kind::External, 1.0 + round as f32);
+            store.commit().unwrap();
+            let real = fs::read(&path).unwrap();
+            fs::write(&path, &real[..real.len() - 4]).unwrap();
+            assert!(Store::open(&path).entries.is_empty());
+        }
+        let kept = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.contains(".corrupt"))
+            })
+            .count();
+        assert!(
+            kept <= KEEP_QUARANTINED,
+            "{kept} quarantined copies kept, expected at most {KEEP_QUARANTINED}"
         );
     }
 

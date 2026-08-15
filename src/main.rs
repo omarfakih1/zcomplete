@@ -124,7 +124,8 @@ At the prompt
   1-9                      pick from the list when the match is unclear
 
 Everything else
-  init <zsh|bash|fish>     print the shell integration
+  init --zsh|--bash|--fish set a shell up, or --all for every one you have
+  init <zsh|bash|fish>     print the integration, which the setup line runs
   query [cmd] <word>       show what a word would resolve to
   stats [cmd] [-n N]       learned commands, strongest first
   import [zsh|bash|fish]   seed the database from shell history
@@ -135,9 +136,8 @@ Everything else
   doctor                   check the installation
 
 Setup
-  zsh    eval \"$(zcomplete init zsh)\"        >> ~/.zshrc
-  bash   eval \"$(zcomplete init bash)\"       >> ~/.bashrc
-  fish   zcomplete init fish | source          >> ~/.config/fish/config.fish
+  zcomplete init --all     add the line for every shell you have installed
+  zcomplete import         seed the database from your history
 
 The shell integration also calls resolve, record and retry. They are its
 business rather than yours.
@@ -146,8 +146,38 @@ business rather than yours.
 }
 
 fn init(args: &[String]) -> Result<i32, Fail> {
-    let Some(name) = args.first() else {
-        fail!("init needs a shell: zsh, bash or fish")
+    let (flags, operands) = split_flags(args);
+    reject_unknown(&flags, &["--zsh", "--bash", "--fish", "--all"])?;
+
+    // `--zsh` sets the shell up, `zsh` prints what the setup line runs. The
+    // flag is for a person doing this once; the bare word is for the rc file
+    // doing it on every shell, and printing anything else there would be
+    // eval'd.
+    let asked: Vec<Shell> = [Shell::Zsh, Shell::Bash, Shell::Fish]
+        .into_iter()
+        .filter(|shell| {
+            let all = flags.iter().any(|f| f == "--all");
+            all || flags
+                .iter()
+                .any(|f| f.trim_start_matches('-') == shell.name())
+        })
+        .collect();
+    if !asked.is_empty() {
+        if let Some(name) = operands.first() {
+            fail!("init takes a shell or a --shell flag, not both (got '{name}')")
+        }
+        // `--all` means every shell on this machine, so one that is not here is
+        // not a problem. A shell named outright was asked for by someone who
+        // knows it is coming, so it gets written either way.
+        let sweep = flags.iter().any(|f| f == "--all");
+        for shell in asked {
+            install(shell, sweep)?;
+        }
+        return Ok(0);
+    }
+
+    let Some(name) = operands.first() else {
+        fail!("init needs a shell: `zcomplete init --zsh` to set one up, `zcomplete init zsh` to print the integration")
     };
     let Some(shell) = Shell::parse(name) else {
         fail!("unsupported shell '{name}' (zsh, bash and fish are supported)")
@@ -160,6 +190,57 @@ fn init(args: &[String]) -> Result<i32, Fail> {
         .create(store::data_dir());
     print!("{}", shell::init_script(shell));
     Ok(0)
+}
+
+/// The line a shell needs in its config to load the integration.
+pub(crate) fn setup_line(shell: Shell) -> &'static str {
+    match shell {
+        Shell::Zsh => "eval \"$(zcomplete init zsh)\"",
+        Shell::Bash => "eval \"$(zcomplete init bash)\"",
+        Shell::Fish => "zcomplete init fish | source",
+    }
+}
+
+/// Adds the setup line to a shell's config, once.
+fn install(shell: Shell, only_if_present: bool) -> Result<(), Fail> {
+    use std::io::Write;
+
+    let files = shell::rc_files(shell);
+    let Some(target) = files.first().cloned() else {
+        fail!("cannot find your home directory, so there is no config to write to")
+    };
+    // Any of them counts as done: bash reads whichever of the two it is given,
+    // and adding the line twice would run the integration twice.
+    if let Some(had) = files.iter().find(|rc| {
+        std::fs::read_to_string(rc).is_ok_and(|text| {
+            text.lines()
+                .any(|line| line.contains("zcomplete init") && !line.trim_start().starts_with('#'))
+        })
+    }) {
+        println!("{}: already set up in {}", shell.name(), had.display());
+        return Ok(());
+    }
+
+    if only_if_present && shell::which(shell.name()).is_none() {
+        println!("{}: not installed, skipped", shell.name());
+        return Ok(());
+    }
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(at(parent))?;
+    }
+    // Appended, and the file is never rewritten: everything else in there is
+    // the user's, and a config lost to this would be a bad trade for a line.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&target)
+        .map_err(at(&target))?;
+    writeln!(file, "\n# zcomplete\n{}", setup_line(shell)).map_err(at(&target))?;
+
+    println!("{}: added to {}", shell.name(), target.display());
+    println!("      run `exec {}` to use it in this shell", shell.name());
+    Ok(())
 }
 
 pub(crate) const VALUED: &[&str] = &["--shell", "--kind", "--status", "-n", "--limit", "--only"];
