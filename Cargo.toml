@@ -9,10 +9,6 @@ license = "MIT"
 readme = "README.md"
 keywords = ["cli", "shell", "zsh", "fish", "autocomplete"]
 categories = ["command-line-utilities"]
-# The pty suite needs three shells and a checkout to run at all, and CI is the
-# only thing that runs it, so it is not worth shipping to someone installing
-# the crate. The workflows sit under the same directory.
-exclude = [".github/"]
 
 [dependencies]
 libc = "0.2.189"

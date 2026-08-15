@@ -1,5 +1,0 @@
-# The pty suite is tooling, not part of what this crate is. Keeps GitHub's
-# language bar reading as Rust rather than a third Python, and keeps the test
-# files out of the source archives attached to a release.
-.github/tests/** linguist-vendored
-.github/tests/** export-ignore

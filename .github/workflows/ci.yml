@@ -41,7 +41,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features
       - run: cargo test
       - run: cargo build --release
-      - run: python3 .github/tests/shells.py
+      - run: python3 tests/shells.py
 
   msrv:
     runs-on: ubuntu-latest

@@ -7,7 +7,7 @@ the confirmation prompt reads /dev/tty directly. A subprocess with pipes proves
 none of it, so each scenario below runs against a shell on a pty and answers the
 prompts by typing at it.
 
-Usage:  python3 .github/tests/shells.py [zsh|bash|fish]...
+Usage:  python3 tests/shells.py [zsh|bash|fish]...
 """
 
 import fcntl

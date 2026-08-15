@@ -298,10 +298,10 @@ real zsh, bash and fish under a pty, which needs all three installed and takes
 about a minute:
 
 ```bash
-cargo test && cargo build --release && python3 .github/tests/shells.py
+cargo test && cargo build --release && python3 tests/shells.py
 ```
 
-`.github/tests/bench.sh` times the hot path against `/usr/bin/true`.
+`tests/bench.sh` times the hot path against `/usr/bin/true`.
 
 ## License
 
