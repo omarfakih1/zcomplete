@@ -171,7 +171,7 @@ fn reap_listings(keep: &Path) {
     }
     // Newest first, and the one just written is not in here at all, so this
     // keeps `KEEP_LISTINGS - 1` others beside it.
-    found.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    found.sort_unstable_by_key(|(at, _)| std::cmp::Reverse(*at));
     for (_, stale) in found.drain(KEEP_LISTINGS - 1..) {
         let _ = fs::remove_file(stale);
     }

@@ -390,7 +390,7 @@ fn reap_quarantined(path: &Path, keep: &Path) {
     if found.len() < KEEP_QUARANTINED {
         return;
     }
-    found.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    found.sort_unstable_by_key(|(at, _)| std::cmp::Reverse(*at));
     for (_, stale) in found.drain(KEEP_QUARANTINED - 1..) {
         let _ = fs::remove_file(stale);
     }
