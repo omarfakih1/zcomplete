@@ -135,7 +135,7 @@ fn plausible_verb(word: &str) -> bool {
 /// The same rule for the command word, which comes off PATH and so is whatever
 /// someone named a file. Wider than `is_verb` because `python3.11` and `g++`
 /// are real programs, but still nothing a shell would read as punctuation.
-fn is_plain_name(word: &str) -> bool {
+pub(crate) fn is_plain_name(word: &str) -> bool {
     !word.is_empty()
         && !word.starts_with(['-', '~'])
         && word

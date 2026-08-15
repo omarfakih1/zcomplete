@@ -127,12 +127,55 @@ fn listing() -> &'static [u8] {
             if written.is_err() {
                 let _ = fs::remove_file(&temp);
             }
+            reap_listings(&cache);
         }
         names
     })
 }
 
 const MAX_LISTING: usize = 4 << 20;
+
+/// How many PATH listings are worth keeping. Each distinct PATH gets its own,
+/// and a venv, a nix-shell, a container and the login shell are all one PATH
+/// each, so a handful is a working set rather than a limit anyone reaches.
+const KEEP_LISTINGS: usize = 4;
+
+/// The listings for PATHs nobody is using any more. One file per distinct PATH
+/// with nothing to remove them was the whole of this tool's disk growth: every
+/// venv activated once left a copy of its PATH's contents behind for good.
+/// Costs one `read_dir` on the rare path that just swept, and never touches the
+/// file it was called about.
+fn reap_listings(keep: &Path) {
+    let Some(dir) = keep.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("path.") && !name.contains(".tmp."))
+        })
+        .filter(|entry| entry.path() != keep)
+        .filter_map(|entry| {
+            let at = entry.metadata().and_then(|meta| meta.modified()).ok()?;
+            Some((at, entry.path()))
+        })
+        .collect();
+    if found.len() < KEEP_LISTINGS {
+        return;
+    }
+    // Newest first, and the one just written is not in here at all, so this
+    // keeps `KEEP_LISTINGS - 1` others beside it.
+    found.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for (_, stale) in found.drain(KEEP_LISTINGS - 1..) {
+        let _ = fs::remove_file(stale);
+    }
+}
 
 fn path_key() -> u64 {
     let mut key: u64 = 0xcbf2_9ce4_8422_2325;
@@ -660,6 +703,49 @@ mod tests {
         assert!(found.contains(&"status".to_string()), "{found:?}");
         assert!(found.contains(&"commit".to_string()), "{found:?}");
         assert!(advertised_verbs("cat").len() < 2);
+    }
+
+    #[test]
+    fn old_path_listings_are_reaped() {
+        let dir = std::env::temp_dir().join(format!("zcomplete-listings-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Ten PATHs' worth of listings, as ten activated venvs would leave.
+        // Distinct mtimes, so "keep the newest" has something to sort on.
+        // `utimes` rather than `File::set_times`, which needs a newer rustc
+        // than this crate builds on.
+        for n in 0..10u64 {
+            let file = dir.join(format!("path.{n:016x}"));
+            fs::write(&file, b"names").unwrap();
+            let when = libc::timeval {
+                tv_sec: n as libc::time_t + 1,
+                tv_usec: 0,
+            };
+            let mut name = file.into_os_string().as_bytes().to_vec();
+            name.push(0);
+            assert_eq!(
+                unsafe { libc::utimes(name.as_ptr().cast(), [when, when].as_ptr()) },
+                0
+            );
+        }
+        let newest = dir.join(format!("path.{:016x}", 9u64));
+        reap_listings(&newest);
+
+        let left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), KEEP_LISTINGS, "kept {left:?}");
+        assert!(
+            left.contains(&format!("path.{:016x}", 9u64)),
+            "the listing in use was reaped: {left:?}"
+        );
+        assert!(
+            !left.contains(&format!("path.{:016x}", 0u64)),
+            "the oldest listing survived: {left:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -786,6 +786,27 @@ def pinned_shortcut_wins(sc):
     assert (sc.home / "pinned-dir").is_dir(), "bound shortcut did not run"
 
 
+@check("init --shell writes the setup line once")
+def init_flag_sets_the_shell_up(sc):
+    rc = {"zsh": ".zshrc", "bash": ".bashrc", "fish": ".config/fish/config.fish"}[sc.kind]
+    added = sc.zcomplete("init", f"--{sc.kind}")
+    assert added.returncode == 0, added.stderr
+    config = sc.home / rc
+    assert config.exists(), f"{rc} was never written: {added.stdout}{added.stderr}"
+    line = config.read_text()
+    assert "zcomplete init" in line, f"the setup line is missing:\n{line}"
+
+    # Twice must not mean two hooks: the second run has to see the first.
+    again = sc.zcomplete("init", f"--{sc.kind}")
+    assert again.returncode == 0, again.stderr
+    assert "already set up" in again.stdout, again.stdout
+    assert config.read_text() == line, "a second init changed the config"
+
+    # And what it wrote has to be what the shell actually runs.
+    printed = sc.zcomplete("init", sc.kind)
+    assert printed.returncode == 0 and "__zcomplete" in printed.stdout, printed.stderr
+
+
 def concurrent_writes_all_land():
     """Eight shells recording at once must not lose each other's counts. The
     lock has to span the read as well as the write, which it did not at first:

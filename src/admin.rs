@@ -228,6 +228,13 @@ pub(crate) fn bind(args: &[String]) -> Result<i32, Fail> {
     if target.split_whitespace().count() > 1 {
         fail!("a shortcut can only point at one command; make '{target}' a shell alias instead")
     }
+    // The same shape a command word has to have to be looked up at all. Without
+    // this an empty word, `a b` or `../../etc/passwd` all bound happily and then
+    // sat there for good: a pin outranks everything when the table is evicted,
+    // so a shortcut that can never be typed pushed out ones that can.
+    if !crate::correct::is_plain_name(word) {
+        fail!("'{word}' is not a word a shell would read as a command, so it could never be typed")
+    }
     let db = store::db_path();
     let mut db_store = store::edit(&db);
     if !shell::on_path(target) && db_store.get(target).is_none() {
@@ -422,9 +429,17 @@ fn report_shell(shell: Shell) -> i32 {
     );
     if !hooked {
         problems += 1;
-        for rc in shell::rc_files(shell) {
-            println!("         add to {}:  {}", rc.display(), setup_line(shell));
-        }
+        println!(
+            "         `zcomplete init --{}` adds it to {}",
+            shell.name(),
+            {
+                let files = shell::rc_files(shell);
+                files.first().map_or_else(
+                    || "your shell config".to_string(),
+                    |rc| rc.display().to_string(),
+                )
+            }
+        );
     }
     if shell == Shell::Bash && bash_major().is_some_and(|version| version < 4) {
         println!("         this bash predates command_not_found_handle, so corrections");
@@ -433,14 +448,6 @@ fn report_shell(shell: Shell) -> i32 {
         problems += 1;
     }
     problems
-}
-
-fn setup_line(shell: Shell) -> &'static str {
-    match shell {
-        Shell::Zsh => "eval \"$(zcomplete init zsh)\"",
-        Shell::Bash => "eval \"$(zcomplete init bash)\"",
-        Shell::Fish => "zcomplete init fish | source",
-    }
 }
 
 fn bash_major() -> Option<u32> {

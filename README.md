@@ -42,19 +42,25 @@ By hand:
 cargo install --git https://github.com/omarfakih1/zcomplete
 ```
 
-then add the line for your shell:
+then let it set your shells up and seed itself:
 
-| shell | line | file |
+```bash
+zcomplete init --all && zcomplete import
+```
+
+`init --all` adds the setup line to every shell you have installed, and does
+nothing to one already set up, so it is safe to run twice. Name one instead if
+you would rather: `--zsh`, `--bash` or `--fish`. It appends and never rewrites,
+so the rest of your config is left alone.
+
+| shell | line it adds | file |
 |---|---|---|
 | zsh | `eval "$(zcomplete init zsh)"` | `~/.zshrc` |
 | bash | `eval "$(zcomplete init bash)"` | `~/.bashrc` |
 | fish | `zcomplete init fish \| source` | `~/.config/fish/config.fish` |
 
-and seed it:
-
-```bash
-zcomplete import
-```
+(`zcomplete init zsh`, without the dashes, prints the integration itself. That
+is what the line above runs; you do not need to type it.)
 
 `import` reads your history file, and asks the shell for its aliases, functions
 and builtins: those are not on `PATH` and would otherwise be discarded as words
@@ -303,6 +309,24 @@ installed. Installing anything moves a directory's mtime and the cache is
 discarded; nothing is cached at all if a directory would not open, or if one
 changed within the second the sweep ran, which is the window where a coarse
 mtime could not tell the change apart.
+
+## Disk
+
+Everything lives in one directory you can delete at any time
+(`~/.local/share/zcomplete`, or `$XDG_DATA_HOME/zcomplete`). Every file in it is
+bounded, so it does not grow without end:
+
+| file | what it is | bound |
+|---|---|---|
+| `commands.bin` | the database | ~160 KB; 4096 scoped rows and 512 shortcuts, oldest and weakest evicted |
+| `path.<hash>` | the names on one `PATH` | the 4 most recently used, one per distinct `PATH` |
+| `journal.<pid>` | what one shell has not folded yet | one per live shell, emptied at each fold |
+| `commands.corrupt.*` | a database that would not read, kept for you | the 2 most recent |
+
+The binary is about 550 KB and links one crate (`libc`).
+
+Before this was bounded, every `PATH` a shell ever had left a listing behind for
+good: activating ten venvs meant ten copies of their contents, kept for ever.
 
 ## Shell differences
 
