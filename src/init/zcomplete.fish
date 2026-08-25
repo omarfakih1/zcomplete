@@ -1,9 +1,8 @@
 # zcomplete: fish integration, loaded by  zcomplete init fish | source
 #
-# fish calls fish_command_not_found *after* abandoning the job, with stdin and
-# stdout back on the terminal: correcting there would hand `cat` the keyboard
-# in `echo hi | ct` and hang the shell. So enter rewrites the command line
-# instead and fish runs the corrected line itself.
+# fish calls fish_command_not_found after abandoning the job, so correcting
+# there would hand `cat` the keyboard in `echo hi | ct`. Enter rewrites the
+# command line instead and fish runs the corrected line itself.
 if not set -q __zcomplete_builtins
     set -g __zcomplete_builtins (builtin --names)
 end
@@ -14,22 +13,22 @@ if functions -q fish_command_not_found; and not functions -q __zcomplete_previou
     end
 end
 
-function __zcomplete_first_word
-    set -l words (string split -n ' ' -- $argv[1])
-    while set -q words[1]
-        switch $words[1]
+# Sets $__zcomplete_words to the line past its wrappers. A global rather than a
+# return value: a command substitution is the most expensive thing on the enter
+# and postexec paths, and this way the call itself needs none.
+function __zcomplete_split --argument-names line
+    set -g __zcomplete_words (string match -ra '\S+' -- $line)
+    while set -q __zcomplete_words[1]
+        switch $__zcomplete_words[1]
             case '*=*' sudo doas command builtin nohup exec env time nice stdbuf
-                set -e words[1]
+                set -e __zcomplete_words[1]
             case '*'
                 break
         end
     end
-    if set -q words[1]
-        echo -- $words[1]
-    end
 end
 
-set -g __zcomplete_since 0
+set -g __zcomplete_since
 if set -q ZCOMPLETE_DATA_DIR; and test -n "$ZCOMPLETE_DATA_DIR"
     set -g __zcomplete_journal $ZCOMPLETE_DATA_DIR/journal.$fish_pid
 else if set -q XDG_DATA_HOME; and test -n "$XDG_DATA_HOME"
@@ -37,14 +36,11 @@ else if set -q XDG_DATA_HOME; and test -n "$XDG_DATA_HOME"
 else
     set -g __zcomplete_journal $HOME/.local/share/zcomplete/journal.$fish_pid
 end
-# Created 0600 here, once, because a redirect takes the shell's umask and the
-# per-command path must not fork to fix it afterwards.
 if not test -e $__zcomplete_journal
-    # Set and put back, rather than forked into a `fish -c` subshell: that
-    # looked the shell up on PATH, and a fish whose own binary is not on PATH
-    # printed `Unknown command: fish` into the session and left the journal to
-    # be created by the first append instead - at the user's umask, which is
-    # usually 0644, on a file listing every command they run and where.
+    # A redirect takes the shell's umask, and this file lists every command you
+    # run and where. Set and put back rather than forked into `fish -c`, which
+    # looked the shell up on PATH and printed `Unknown command: fish` when it
+    # was not there.
     set -l __zcomplete_umask (umask)
     umask 077
     echo -n '' >>$__zcomplete_journal 2>/dev/null
@@ -53,27 +49,16 @@ end
 
 function __zcomplete_record --on-event fish_postexec
     set -l ret $status
-    # The rerun below is itself a command, and fish would announce it here.
-    # Cleared on the way past rather than after the eval: a ctrl-c during the
-    # rerun never reaches the line that clears it, and a guard left standing
-    # would silence the hook for the rest of the session.
+    # The rerun below is a command too, and fish announces it here. Cleared on
+    # the way past rather than after the eval: a ctrl-c during the rerun never
+    # reaches the line that clears it, and a guard left standing would silence
+    # the hook for the rest of the session.
     if set -q __zcomplete_rerunning
         set -e __zcomplete_rerunning
         return
     end
-    # Split once, inline: a command substitution is the most expensive thing
-    # left on this path, and calling out for the first word and again for the
-    # second paid for two.
-    set -l words (string split -n ' ' -- $argv[1])
-    while set -q words[1]
-        switch $words[1]
-            case '*=*' sudo doas command builtin nohup exec env time nice stdbuf
-                set -e words[1]
-            case '*'
-                break
-        end
-    end
-    set -l word $words[1]
+    __zcomplete_split $argv[1]
+    set -l word $__zcomplete_words[1]
     test -n "$word"; or return
     if string match -q -- '*/*' $word
         return
@@ -86,31 +71,30 @@ function __zcomplete_record --on-event fish_postexec
         set jkind fish
     end
 
-    # A command that worked needs no correction, so all that is left is counting
-    # it, and an append costs no process where starting zcomplete costs one.
-    # fish has no clock builtin and `date` is a process, so the time is left at
-    # 0 and the fold dates the line by the journal's own mtime instead.
+    # An append costs no process where starting zcomplete costs one. fish has no
+    # clock builtin, so the time is left at 0 and the fold dates the line by the
+    # journal's own mtime.
     if test $ret -eq 0
         set -l verb ''
-        for candidate in $words[2..-1]
+        for candidate in $__zcomplete_words[2..-1]
             if string match -qr '^[A-Za-z0-9_][-_A-Za-z0-9]*$' -- $candidate
                 set verb $candidate
                 break
             end
         end
-        if string match -qr '[|&;()`]' -- $argv[1]
+        if string match -qr '[|&;()`\n]' -- $argv[1]
             set verb ''
         end
         # A newline in $PWD would end the record early and let the rest of the
-        # directory's name pose as a second one, so such a directory goes
-        # uncounted. `2>/dev/null` goes first: a redirection that fails reports
-        # it on whatever stderr is at the time.
-        if not string match -qr \n -- $PWD
-            echo "0 $jkind $word $verb $PWD" 2>/dev/null >>$__zcomplete_journal
+        # name pose as a second directory. Paid for only when there is one.
+        set -l here $PWD
+        if string match -qr \n -- $here
+            set here (string replace -a \n '?' -- $here)
         end
-        set -g __zcomplete_since (math $__zcomplete_since + 1)
-        if test $__zcomplete_since -ge 200
-            set -g __zcomplete_since 0
+        echo "0 $jkind $word $verb $here" 2>/dev/null >>$__zcomplete_journal
+        set -ga __zcomplete_since x
+        if set -q __zcomplete_since[200]
+            set -g __zcomplete_since
             command zcomplete flush 2>/dev/null
         end
         return
@@ -131,7 +115,8 @@ function __zcomplete_rewrite
 
     set -l unknown
     for part in (string split -- '|' (string replace -ra '[;&()\n]' '|' -- $line))
-        set -l word (__zcomplete_first_word "$part")
+        __zcomplete_split $part
+        set -l word $__zcomplete_words[1]
         if test -n "$word"; and not type -q -- $word
             set -a unknown $word
         end
@@ -139,9 +124,9 @@ function __zcomplete_rewrite
 
     if set -q unknown[1]
         set -l fixed (command zcomplete retry --shell fish --inline --only (string join ',' $unknown) -- $line | string collect)
-        set -l answered $status
-        if test $answered -eq 0 -a -n "$fixed"
-            if type -q -- (__zcomplete_first_word "$fixed")
+        if test $status -eq 0 -a -n "$fixed"
+            __zcomplete_split $fixed
+            if type -q -- $__zcomplete_words[1]
                 commandline --replace -- $fixed
             end
         end
@@ -150,16 +135,13 @@ end
 
 # Hand over to whatever enter already did rather than calling `commandline -f
 # execute`: fish's own knows about incomplete commands, abbreviations and
-# history, and a user's own binding survives. Enter is CR from a terminal
-# and LF from anything feeding fish through a pty.
+# history, and a user's own binding survives. Enter is CR from a terminal and
+# LF from anything feeding fish through a pty.
 function __zcomplete_bind_enter --argument-names mode key
-    # fish prints the preset binding first and any binding of the user's own
-    # after it, so the last line is the one in force. The flags between `bind`
-    # and the key have to be stepped over rather than assumed away: under vi
-    # keys the preset reads `bind --preset -m insert enter execute`, and taking
-    # the first word after `--preset` would leave `insert enter execute` as the
-    # command. `-m` also has to be carried over, since it is what makes enter
-    # leave normal mode.
+    # The last line is the binding in force. The flags between `bind` and the
+    # key are stepped over rather than assumed away: under vi keys the preset
+    # reads `bind --preset -m insert enter execute`. `-m` is carried over, since
+    # it is what makes enter leave normal mode.
     set -l lines (bind -M $mode $key 2>/dev/null)
     set -l command
     set -l sets
@@ -175,12 +157,10 @@ function __zcomplete_bind_enter --argument-names mode key
     if test -z "$command"; or string match -q '*__zcomplete_rewrite*' -- "$command"
         set command execute
     end
-    # A bare `execute` bound after another command goes dead before fish 4:
-    # `bind` installs it without complaint, but the key then fires nothing at
-    # all, not even the command in front of it. Queueing it as `commandline -f
-    # execute` runs there, and only there: the queue is dropped when a command
-    # that took the terminal hands it back, which is every correction we make,
-    # so on a fish that runs the bare name inline it stays the bare name.
+    # A bare `execute` bound after another command goes dead before fish 4: the
+    # key then fires nothing at all. Queueing it runs there, and the queue is
+    # dropped when a command that took the terminal hands it back, which is
+    # every correction we make.
     if test "$command" = execute; and string match -qr '^[0-3]\.' -- $FISH_VERSION
         set command 'commandline -f execute'
     end

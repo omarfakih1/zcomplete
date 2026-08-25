@@ -13,8 +13,6 @@ pub(crate) fn stats(args: &[String]) -> Result<i32, Fail> {
         .and_then(|n| n.parse().ok())
         .unwrap_or(25);
 
-    // Folded first: what a person asked to see should be what has happened, not
-    // what has happened minus whatever this shell has not flushed yet.
     let db = store::db_path();
     let mut writing = store::edit(&db);
     let folded = crate::correct::fold(&mut writing);
@@ -27,8 +25,7 @@ pub(crate) fn stats(args: &[String]) -> Result<i32, Fail> {
             println!("nothing learned about {parent} yet");
             return Ok(NO_MATCH);
         }
-        // By name on a tie: the scoped table is a HashMap, so equally used verbs
-        // would swap places between runs.
+        // By name on a tie: the scoped table is a HashMap.
         ranked.sort_by(|a, b| {
             store::frecency(b.rank, b.last, at)
                 .total_cmp(&store::frecency(a.rank, a.last, at))
@@ -116,8 +113,7 @@ pub(crate) fn import(args: &[String]) -> Result<i32, Fail> {
         println!("{}: {seen} commands from {}", shell.name(), path.display());
     }
 
-    // A subcommand you use turns up in history many times; a filename turns up
-    // once. History does not record what exited zero, so repetition is all there is.
+    // History does not record what exited zero, so repetition is all there is.
     let mut learned_verbs = 0usize;
     for ((parent, verb), count) in &verbs {
         if *count >= 2 {
@@ -159,8 +155,6 @@ fn absorb(
         if db_store.is_ignored(word) {
             continue;
         }
-        // An alias is not on PATH and never will be, so the only evidence that
-        // `gs` is a command is that the shell says so and history says you ran it.
         let kind = match shell::on_path(word) {
             true => Kind::External,
             false if defined.contains(word) => Kind::Shell(shell),
@@ -178,7 +172,6 @@ fn absorb(
                 continue;
             };
             let verb = &entry.line[call.verb.0..call.verb.1];
-            // No `plausible_verb` here: the directory a history line ran in is gone.
             if is_verb(verb) && verb.len() <= 24 && shell::on_path(call.parent) {
                 *verbs
                     .entry((call.parent.to_owned(), verb.to_owned()))
@@ -192,12 +185,8 @@ fn absorb(
 pub(crate) fn forget(args: &[String]) -> Result<i32, Fail> {
     let db = store::db_path();
     let mut db_store = store::edit(&db);
-    // Buffered lines first, or a shell that has been counting `rm` all morning
-    // puts it back at its next flush and the forget looks like it never happened.
+    // Buffered lines first, or the next flush puts back what was forgotten.
     let folded = crate::correct::fold(&mut db_store);
-    // On its own, never alongside names: `forget git --all` reads as a careless
-    // way of saying `forget git`, and emptying the database on it is not a
-    // mistake anyone gets to take back.
     if args.iter().any(|a| a == "--all") {
         if args.len() > 1 {
             fail!("--all empties the database, so it takes no command names")
@@ -228,10 +217,8 @@ pub(crate) fn bind(args: &[String]) -> Result<i32, Fail> {
     if target.split_whitespace().count() > 1 {
         fail!("a shortcut can only point at one command; make '{target}' a shell alias instead")
     }
-    // The same shape a command word has to have to be looked up at all. Without
-    // this an empty word, `a b` or `../../etc/passwd` all bound happily and then
-    // sat there for good: a pin outranks everything when the table is evicted,
-    // so a shortcut that can never be typed pushed out ones that can.
+    // A pin outranks everything on eviction, so one that can never be typed
+    // would push out ones that can.
     if !crate::correct::is_plain_name(word) {
         fail!("'{word}' is not a word a shell would read as a command, so it could never be typed")
     }
@@ -308,8 +295,6 @@ pub(crate) fn mode(args: &[String]) -> Result<i32, Fail> {
     db_store.set_mode(mode);
     db_store.commit().map_err(at(&db))?;
     println!("{mode} - {}", mode.describe());
-    // The environment wins over the database, so saying nothing here would be
-    // reporting a change that no shell carrying this variable will act on.
     if let Some(forced) = std::env::var_os("ZCOMPLETE_MODE") {
         println!(
             "note: ZCOMPLETE_MODE={} overrides this wherever it is exported",

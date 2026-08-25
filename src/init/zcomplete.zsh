@@ -9,9 +9,9 @@ if (( $+functions[command_not_found_handler] )) && (( ! $+functions[__zcomplete_
     fi
 fi
 
-# Sets REPLY to the command and REPLY2 to its verb. The verb is the first bare
-# word after the command, not simply the second word: `sudo git status` is about
-# `status`, and taking word two there would teach git a subcommand called git.
+# REPLY is the command, REPLY2 its verb: the first bare word after it, not
+# simply word two. `sudo git status` is about `status`, and word two there
+# would teach git a subcommand called git.
 __zcomplete_first_word() {
     local -a words
     words=(${(z)1})
@@ -51,12 +51,10 @@ __zcomplete_precmd() {
     __zcomplete_first_word "$line"
     [[ -n $REPLY && $REPLY != */* ]] || return $ret
 
-    # The not-found hook ran in a fork, found an alias or a function there, and
-    # handed it back rather than running it: a fork is exactly what cannot keep
-    # what those do. Here we are the shell itself, so a `cd` in one sticks.
-    # `whence` as well as the status: 5 is what the not-found hook returns for a
-    # correction only the real shell can run, but it is also just a number, and
-    # a command of the user's own that exits 5 must not be called missing.
+    # The not-found hook ran in a fork, found an alias or a function, and
+    # handed it back rather than running it there. Here we are the shell, so a
+    # `cd` in one sticks. `whence` as well as the status, because 5 is also
+    # just a number and a command of the user's own must not be called missing.
     if (( ret == 5 )) && ! whence -- "$REPLY" >/dev/null 2>&1; then
         fixed=$(\command zcomplete retry --shell zsh --only "$REPLY" -- "$line")
         if [[ -n $fixed ]]; then
@@ -75,18 +73,16 @@ __zcomplete_precmd() {
         kind=auto jkind=x
     fi
 
-    # The command worked, so there is nothing to correct and nothing to ask:
-    # all that is left is counting it, and a line appended here costs no process
-    # at all where starting zcomplete costs two and a half milliseconds. The
-    # next run that takes the write lock folds these in.
+    # Nothing to correct on a command that worked, so it is only counted. An
+    # append costs no process where starting zcomplete costs 2.5ms. The next
+    # run that takes the write lock folds these in.
     if (( ret == 0 )); then
         local verb=$REPLY2
         # Anything that could hide a second command hides the verb too.
         [[ $line == *[\|\&\;\(\)\`]* || $line == *$'\n'* ]] && verb=
-        # A newline in $PWD would end the record early and let the rest of the
-        # directory's name pose as a second one. Substituted, not skipped, and
-        # by the parameter expansion rather than a command: this path forks for
-        # nothing.
+        # A newline in $PWD would end the record early and let the rest of
+        # the name pose as a second directory. Substituted by the parameter
+        # expansion rather than a command: this path forks for nothing.
         { print -r -- "${EPOCHSECONDS:-0} $jkind $REPLY $verb ${PWD//$'\n'/?}" >>$__zcomplete_journal } 2>/dev/null
         if (( ++__zcomplete_since >= 200 )); then
             __zcomplete_since=0
@@ -129,8 +125,8 @@ command_not_found_handler() {
         fi
         return $?
     fi
-    # Left for precmd, which is the shell and not a fork of it. Silent, because
-    # the correction has not been offered yet.
+    # Left for precmd, which is the shell and not a fork of it. Silent: the
+    # correction has not been offered yet.
     (( ret == 5 )) && return 5
     (( ret == 130 )) && return 130
 
@@ -142,8 +138,7 @@ command_not_found_handler() {
     return 127
 }
 
-# A clock without a fork. Everything the recording half writes has to cost
-# nothing, and `date` would cost more than the process it replaces.
+# A clock without a fork: `date` would cost more than the process it replaces.
 zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
 typeset -g __zcomplete_since=0
 typeset -g __zcomplete_journal=${ZCOMPLETE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zcomplete}/journal.$$
@@ -186,6 +181,6 @@ if (( $+functions[compdef] )); then
     compdef _zcomplete zcomplete 2>/dev/null
 fi
 
-# compdef can be an autoload stub compinit has not filled in yet, and a failed
+# compdef can be an autoload stub compinit has not filled in, and a failed
 # registration must not hand your .zshrc a non-zero status.
 true

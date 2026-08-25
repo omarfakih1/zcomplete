@@ -1,6 +1,8 @@
 //! PATH, the init snippets, and history files. The only module that runs
 //! another program or reads a file it did not write.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -26,8 +28,6 @@ fn path_dirs() -> &'static [Vec<u8>] {
             return dirs;
         };
         for dir in path.as_bytes().split(|byte| *byte == b':') {
-            // A repeated entry can never win over its first appearance, and
-            // scanning it again is the single most expensive thing here.
             if !dir.is_empty() && !dirs.iter().any(|seen| seen == dir) {
                 dirs.push(dir.to_vec());
             }
@@ -36,14 +36,22 @@ fn path_dirs() -> &'static [Vec<u8>] {
     })
 }
 
+/// One `stat` per PATH directory, asked once per name.
 pub fn on_path(name: &str) -> bool {
-    if name.is_empty() || name.contains('/') {
-        return false;
+    thread_local! {
+        static ANSWERED: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
+    }
+    if let Some(known) = ANSWERED.with(|seen| seen.borrow().get(name).copied()) {
+        return known;
     }
     let mut buf = [0u8; 4096];
-    path_dirs()
-        .iter()
-        .any(|dir| is_program(&mut buf, dir, name.as_bytes()))
+    let found = !name.is_empty()
+        && !name.contains('/')
+        && path_dirs()
+            .iter()
+            .any(|dir| is_program(&mut buf, dir, name.as_bytes()));
+    ANSWERED.with(|seen| seen.borrow_mut().insert(name.to_owned(), found));
+    found
 }
 
 fn is_program(buf: &mut [u8; 4096], dir: &[u8], name: &[u8]) -> bool {
@@ -63,8 +71,6 @@ fn is_program(buf: &mut [u8; 4096], dir: &[u8], name: &[u8]) -> bool {
     found && info.st_mode & libc::S_IFMT == libc::S_IFREG && info.st_mode & 0o111 != 0
 }
 
-/// Sorted and deduplicated already: that was done once, when the listing was
-/// built, rather than on every miss for a set that has not changed since.
 pub fn path_names(wanted: impl Fn(&str) -> bool) -> impl Iterator<Item = &'static str> {
     listing()
         .split(|byte| *byte == 0)
@@ -72,39 +78,36 @@ pub fn path_names(wanted: impl Fn(&str) -> bool) -> impl Iterator<Item = &'stati
         .filter(move |name| !name.is_empty() && wanted(name))
 }
 
-/// Every name on PATH, NUL separated, from the cache when the directories are
-/// as they were and from a sweep otherwise. Reading every directory is by far
-/// the slowest thing zcomplete does, and it is all wasted when nothing changed.
+/// Every name on PATH, NUL separated: from the cache when the directories are
+/// as they were, from a sweep otherwise.
 fn listing() -> &'static [u8] {
     static NAMES: OnceLock<Vec<u8>> = OnceLock::new();
     NAMES.get_or_init(|| {
-        // Named for the directory list and validated by their metadata. Named
-        // for both and every install would orphan a file: a venv, a nix-shell
-        // and the login shell each want their own, and each wants it reused.
+        // Named for the directory list, validated by its metadata. Named for
+        // both and every install would orphan a file.
         let cache = crate::store::db_path().with_file_name(format!("path.{:016x}", path_key()));
         let (stamp, settled) = path_stamp();
-        if let Some(names) = fs::read(&cache).ok().and_then(|blob| {
-            // The stamp's own length comes last. A directory deleted off PATH
-            // since the sweep makes the new stamp shorter, and comparing it as
-            // a bare suffix would then be reading part of the old one.
+        if let Some(names) = fs::read(&cache).ok().and_then(|mut blob| {
+            // The stamp's length comes last: a shorter new stamp compared as
+            // a bare suffix would read part of the old one.
             let end = blob.len().checked_sub(8)?;
             let mut len = [0u8; 8];
             len.copy_from_slice(blob.get(end..)?);
             let split = end.checked_sub(usize::try_from(u64::from_le_bytes(len)).ok()?)?;
-            (blob.get(split..end)? == stamp).then(|| blob[..split].to_vec())
+            (blob.get(split..end)? == stamp).then(|| {
+                blob.truncate(split);
+                blob
+            })
         }) {
             return names;
         }
 
-        let (mut names, whole) = sweep();
-        names = ordered(names);
-        // Not written when a directory would not open, or one EMFILE would be
-        // cached as the truth until something happened to change an mtime; nor
-        // when a directory changed this second, because on a filesystem that
-        // keeps mtimes to the second an install landing right after this sweep
-        // would leave a stamp we cannot tell from the one we just took.
-        // Unlocked on purpose: two shells that scan at once write the same
-        // bytes, and rename decides which copy survives.
+        let (names, whole) = sweep();
+        let names = ordered(names);
+        // Not written on a directory that would not open, nor on one that
+        // changed this second: an install landing right after the sweep would
+        // leave a stamp we cannot tell from the one just taken. Unlocked,
+        // because two shells scanning at once write the same bytes.
         if whole && settled && names.len() <= MAX_LISTING {
             let mut blob = names.clone();
             blob.extend_from_slice(&stamp);
@@ -135,46 +138,16 @@ fn listing() -> &'static [u8] {
 
 const MAX_LISTING: usize = 4 << 20;
 
-/// How many PATH listings are worth keeping. Each distinct PATH gets its own,
-/// and a venv, a nix-shell, a container and the login shell are all one PATH
-/// each, so a handful is a working set rather than a limit anyone reaches.
 const KEEP_LISTINGS: usize = 4;
 
-/// The listings for PATHs nobody is using any more. One file per distinct PATH
-/// with nothing to remove them was the whole of this tool's disk growth: every
-/// venv activated once left a copy of its PATH's contents behind for good.
-/// Costs one `read_dir` on the rare path that just swept, and never touches the
-/// file it was called about.
+/// One file per distinct PATH, and every venv activated once leaves one.
 fn reap_listings(keep: &Path) {
     let Some(dir) = keep.parent() else {
         return;
     };
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with("path.") && !name.contains(".tmp."))
-        })
-        .filter(|entry| entry.path() != keep)
-        .filter_map(|entry| {
-            let at = entry.metadata().and_then(|meta| meta.modified()).ok()?;
-            Some((at, entry.path()))
-        })
-        .collect();
-    if found.len() < KEEP_LISTINGS {
-        return;
-    }
-    // Newest first, and the one just written is not in here at all, so this
-    // keeps `KEEP_LISTINGS - 1` others beside it.
-    found.sort_unstable_by_key(|(at, _)| std::cmp::Reverse(*at));
-    for (_, stale) in found.drain(KEEP_LISTINGS - 1..) {
-        let _ = fs::remove_file(stale);
-    }
+    crate::store::reap(dir, keep, KEEP_LISTINGS, |name| {
+        name.starts_with("path.") && !name.contains(".tmp.")
+    });
 }
 
 fn path_key() -> u64 {
@@ -188,15 +161,11 @@ fn path_key() -> u64 {
     key
 }
 
-/// What the cache is checked against: one `stat` per directory rather than one
-/// `readdir` per entry, so it costs the same on a PATH with ten thousand
-/// programs as on one with ten. Installing anything moves its directory's mtime,
-/// and swapping a profile symlink moves the inode, which is what makes this
-/// sound where mtimes are normalised to a constant.
+/// What the cache is checked against: one `stat` per directory, not one
+/// `readdir` per entry. The inode is in it too, for the normalised mtimes a
+/// profile symlink swap leaves behind.
 ///
-/// The second return says every directory is old enough that a change to one
-/// would show: a stamp taken in the same second as the change it is meant to
-/// notice cannot be trusted to differ from the next one.
+/// The second return says every directory is old enough that a change shows.
 fn path_stamp() -> (Vec<u8>, bool) {
     let mut stamp = Vec::with_capacity(path_dirs().len() * 32);
     let mut settled = true;
@@ -221,8 +190,7 @@ fn path_stamp() -> (Vec<u8>, bool) {
     (stamp, settled)
 }
 
-/// Sorted and deduplicated once, so the two directories that both hold `python3`
-/// cost one name here rather than a sort on every question asked of it.
+/// Once, so the two directories that both hold `python3` cost one name.
 fn ordered(blob: Vec<u8>) -> Vec<u8> {
     let mut names: Vec<&[u8]> = blob
         .split(|byte| *byte == 0)
@@ -238,8 +206,7 @@ fn ordered(blob: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// Where errno lives, on the platforms that name it. `None` elsewhere, which
-/// costs only the old behaviour of reading a failed `readdir` as the end.
+/// Where errno lives. `None` elsewhere costs only reading a failure as the end.
 fn errno_slot() -> Option<*mut libc::c_int> {
     #[cfg(any(target_os = "macos", target_os = "ios", target_vendor = "apple"))]
     {
@@ -268,16 +235,13 @@ fn sweep() -> (Vec<u8>, bool) {
         path[dir.len()] = 0;
         let handle = unsafe { libc::opendir(path.as_ptr().cast()) };
         if handle.is_null() {
-            // A directory on PATH that is not there at all is normal and says
-            // nothing; one that exists and would not open is a failure.
+            // Absent is normal; present and unopenable is a failure.
             whole &= std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound;
             continue;
         }
         loop {
-            // Zeroed first: `readdir` returns NULL both at the end of a
-            // directory and on a failure, and errno is the only thing that
-            // tells them apart. A listing truncated by an error and then cached
-            // as complete would hide every program past it.
+            // `readdir` returns NULL at the end and on failure alike, and a
+            // truncated listing cached as complete hides every program past it.
             if let Some(errno) = errno_slot() {
                 unsafe { *errno = 0 };
             }
@@ -288,8 +252,8 @@ fn sweep() -> (Vec<u8>, bool) {
                 }
                 break;
             }
-            // Through a raw pointer, never `&*entry`: a record is only `d_reclen`
-            // bytes, so a reference would claim bytes past the last one in a buffer.
+            // Through a raw pointer, never `&*entry`: a record is only
+            // `d_reclen` bytes, so a reference would claim bytes past the end.
             let name =
                 unsafe { std::ffi::CStr::from_ptr(std::ptr::addr_of!((*entry).d_name).cast()) };
             let name = name.to_bytes();
@@ -381,8 +345,7 @@ fn bare_word(word: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Runs something and gives up on it. `keep_errors` merges the two streams
-/// through one file offset, for tools that split their help across both.
+/// Runs something and gives up on it. `keep_errors` merges both streams.
 fn capture(
     program: &Path,
     args: &[&str],
@@ -391,15 +354,14 @@ fn capture(
 ) -> Option<String> {
     use std::process::{Command, Stdio};
 
-    // Beside the database, not in /tmp: the pid is guessable, and `File::create`
-    // on a symlink someone else planted there writes through it.
+    // Beside the database, not in /tmp: the pid is guessable, and
+    // `File::create` on a symlink someone else planted writes through it.
     let sink = crate::store::db_path().with_file_name(format!("out.{}", std::process::id()));
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(sink.parent()?)
         .ok()?;
-    // A crash leaves one behind, and pids come round again.
     let _ = fs::remove_file(&sink);
     let file = fs::OpenOptions::new()
         .write(true)
@@ -451,21 +413,17 @@ fn help_output(name: &str) -> Option<String> {
     )
 }
 
-/// The aliases, functions and builtins the shell has right now. History alone
-/// cannot see them: `gs` is not on PATH, so an import drops it, and the word
-/// you type twenty times a day never enters the database.
-///
-/// Interactive, because that is the only kind of shell that reads the file your
-/// aliases live in. Errors are dropped: an interactive bash with no terminal
-/// complains about job control before it does anything useful.
+/// The aliases, functions and builtins the shell has now: `gs` is not on PATH,
+/// so history alone drops it. Interactive, because only that kind of shell
+/// reads the file aliases live in.
 pub fn defined_words(shell: Shell) -> Vec<String> {
     let script = match shell {
         Shell::Zsh => "print -rl -- ${(k)aliases} ${(k)functions} ${(k)builtins}",
         Shell::Bash => "compgen -a; compgen -A function; compgen -b",
-        // A fish alias is a function, and `functions -n` is one comma-separated line.
+        // A fish alias is a function; `functions -n` is one comma-separated line.
         Shell::Fish => "functions -n | string split ', '; builtin -n",
     };
-    // fish reads its config for `-c` as well, and its `-i` wants a terminal.
+    // fish reads its config for `-c` too, and its `-i` wants a terminal.
     let mode = match shell {
         Shell::Fish => "-c",
         _ => "-ic",

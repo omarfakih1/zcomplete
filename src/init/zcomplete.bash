@@ -19,8 +19,8 @@ __zcomplete_is_builtin() {
 __zcomplete_record() {
     local __zc_exit=$?
     local entry number line typed word kind jkind verb fixed globbing
-    # The user's IFS is theirs, but splitting the line on it would put half a
-    # path where a command name belongs.
+    # The user's IFS is theirs, but splitting on it would put half a path
+    # where a command name belongs.
     local IFS=$' \t\n'
 
     # `history 1` gives "  512  git status". The event number is what stops a
@@ -36,9 +36,9 @@ __zcomplete_record() {
     line=${line#"${line%%[![:space:]]*}"}
     typed=$line
 
-    # Split once, with globbing off. `set -- $line` on `ls *` otherwise hands
-    # back the directory's own files, and the second of them would be written
-    # down as a subcommand of ls.
+    # Split once, globbing off. `set -- $line` on `ls *` otherwise hands back
+    # the directory's files, and the second would be written down as a
+    # subcommand of ls.
     case $- in *f*) globbing= ;; *) globbing=1; set -f ;; esac
     set -- $line
     [ -z "$globbing" ] || set +f
@@ -55,10 +55,10 @@ __zcomplete_record() {
         ''|*/*) return $__zc_exit ;;
     esac
 
-    # Two ways to arrive here with the line still unrun: bash 3.2 has no
-    # interception at all, and on bash 4 the handler hands back an alias or a
-    # function rather than running it in a fork that cannot keep what it does.
-    # Either way this is the real shell, so a `cd` in the rewritten line sticks.
+    # Two ways to arrive with the line still unrun: bash 3.2 cannot intercept
+    # at all, and on bash 4 the handler hands back an alias or a function
+    # rather than running it in a fork. Either way this is the real shell, so
+    # a `cd` in the rewritten line sticks.
     if { [ "$__zc_exit" -eq 5 ] ||
         { [ "${BASH_VERSINFO[0]}" -lt 4 ] && [ "$__zc_exit" -eq 127 ]; }; } &&
         ! type "$word" >/dev/null 2>&1; then
@@ -91,10 +91,10 @@ __zcomplete_record() {
             esac
         done
         case $typed in *[\|\&\;\(\)\`]*) verb= ;; esac
-        # A newline in $PWD would end the record early and let the rest of the
-        # directory's name pose as a second one. `2>/dev/null` goes first: a
-        # redirection that fails reports it on whatever stderr is at the time,
-        # so putting it after the append is too late to silence it.
+        # A newline in $PWD would end the record early and let the rest of
+        # the name pose as a second directory. `2>/dev/null` goes first: a
+        # failed redirection reports on whatever stderr is at the time, so
+        # after the append is too late to silence it.
         printf '%s %s %s %s %s\n' "${EPOCHSECONDS:-0}" "$jkind" "$word" "$verb" "${PWD//$'\n'/?}" \
             2>/dev/null >>"$__zcomplete_journal"
         __zcomplete_since=$(( ${__zcomplete_since:-0} + 1 ))
@@ -157,9 +157,8 @@ __zcomplete_journal=${ZCOMPLETE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/z
 # per-command path must not fork to fix it afterwards.
 [ -e "$__zcomplete_journal" ] || ( umask 077; : >>"$__zcomplete_journal" ) 2>/dev/null
 
-# The history file is already loaded when the first prompt is drawn, so without
-# this the last command of the previous session is recorded as if it had just
-# been run here.
+# History is already loaded when the first prompt is drawn, so without this
+# the previous session's last command is recorded as if it just ran here.
 __zcomplete_last_event=$(HISTTIMEFORMAT='' history 1 2>/dev/null)
 __zcomplete_last_event=${__zcomplete_last_event#"${__zcomplete_last_event%%[![:space:]]*}"}
 __zcomplete_last_event=${__zcomplete_last_event%%[![:digit:]]*}

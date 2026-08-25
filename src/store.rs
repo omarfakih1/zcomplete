@@ -1,5 +1,6 @@
 //! The on-disk store, rewritten whole on every save.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -10,8 +11,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: [u8; 4] = *b"ZCDB";
-/// Anything appended after the last table decodes by omission, so an older
-/// file still reads. 2 added the settings trailer.
+/// Trailing tables decode by omission, so an older file still reads.
 const FORMAT: u32 = 2;
 
 const HOUR: u64 = 3_600;
@@ -29,7 +29,7 @@ pub const PINNED: i32 = 1 << 20;
 pub const STICKY_AT: i32 = 3;
 pub const BURIED_AT: i32 = -2;
 
-/// A live success is 1.0 and a history sighting 0.5: `git status` clears this,
+/// A live success is 1.0, a history sighting 0.5: `git status` clears this,
 /// the `foo` in `grep foo x.c` never does.
 pub const VERB_CONFIDENCE: f32 = 2.0;
 pub const VERBS_TO_QUALIFY: usize = 2;
@@ -164,10 +164,15 @@ type Ranks = HashMap<String, (f32, u64)>;
 
 pub struct Store {
     pub entries: Vec<Entry>,
-    /// The scoped section as it came off disk, plus an index built on first
-    /// use. Every caller wants one scope, and decoding all of them into nested
-    /// maps was three quarters of the cost of opening the database.
+    /// Name to position in `entries`, and the running sum of their ranks. Both
+    /// were linear scans per bump.
+    at_name: HashMap<String, usize>,
+    total: f32,
+    /// The scoped section as it came off disk, indexed on first use. Every
+    /// caller wants one scope, and decoding all of them was most of the cost
+    /// of opening the database.
     raw: Vec<u8>,
+    raw_count: usize,
     index: OnceLock<HashMap<u64, Vec<u32>>>,
     /// Scopes that have been read into memory. Overrides `raw` for those ids.
     scoped: HashMap<u64, Ranks>,
@@ -183,7 +188,10 @@ impl Default for Store {
     fn default() -> Store {
         Store {
             entries: Vec::new(),
+            at_name: HashMap::new(),
+            total: 0.0,
             raw: Vec::new(),
+            raw_count: 0,
             index: OnceLock::new(),
             scoped: HashMap::new(),
             bindings: Vec::new(),
@@ -223,8 +231,8 @@ pub fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// One decimal place without `core::fmt`'s float printer, which is nine
-/// kilobytes of binary linked in for two commands that print a diagnostic.
+/// One decimal place without `core::fmt`'s float printer, which is 9KB of
+/// binary for two commands that print a diagnostic.
 pub fn tenths(value: f32) -> String {
     let scaled = (value.max(0.0) * 10.0).round() as u64;
     format!("{}.{}", scaled / 10, scaled % 10)
@@ -276,32 +284,21 @@ pub fn edit(path: &Path) -> Editing {
 }
 
 impl Editing {
-    /// Whether this edit actually holds the lock. `flock` fails outright on some
-    /// network mounts, and a caller about to consume something it cannot put
-    /// back wants to know that before it starts rather than after.
+    /// `flock` fails outright on some network mounts.
     pub fn locked(&self) -> bool {
         self.lock.is_some()
     }
 
-    pub fn commit(mut self) -> io::Result<Store> {
-        // The lock we took is on an inode that is no longer at that name, so
-        // the directory went out from under us and somebody else is holding
-        // what is there now. Losing one run's counts beats overwriting a
-        // database that a process we cannot see is in the middle of writing.
-        if self.lock.as_ref().is_some_and(|lock| !lock.current()) {
-            self.lock = None;
-            return Ok(self.store);
-        }
-        let result = self.store.write(&self.path);
-        self.lock = None;
-        result.map(|()| self.store)
+    pub fn commit(self) -> io::Result<Store> {
+        self.commit_taking(Vec::new())
     }
 
-    /// Commit, then delete `taken` before the lock goes. Unlinking after the
-    /// lock was released let the next folder pick the same journals up and
-    /// apply them again, which is how an emptied database refilled itself.
-    /// Only after a write that landed: journals kept are counts kept.
+    /// Commit, then delete `taken` before the lock goes: unlinking after it
+    /// was released let the next fold apply the same journals again. Only after
+    /// a write that landed, since journals kept are counts kept.
     pub fn commit_taking(mut self, taken: Vec<PathBuf>) -> io::Result<Store> {
+        // The inode we locked is no longer at that name, so somebody else
+        // holds what is. Losing a run's counts beats overwriting mid-write.
         if self.lock.as_ref().is_some_and(|lock| !lock.current()) {
             self.lock = None;
             return Ok(self.store);
@@ -331,18 +328,14 @@ impl std::ops::DerefMut for Editing {
     }
 }
 
-/// Move an unreadable database aside, to a name nothing else holds. One fixed
-/// `commands.corrupt` meant the second corruption renamed over the copy taken
-/// for the first, so the only intact database anyone still had was destroyed by
-/// the thing meant to be saving it.
+/// Moves an unreadable database aside, to a name nothing else holds.
 fn quarantine(path: &Path) -> Option<PathBuf> {
     for attempt in 0..16 {
         let kept = path.with_extension(match attempt {
             0 => format!("corrupt.{}", now()),
             n => format!("corrupt.{}.{n}", now()),
         });
-        // Nothing is ever renamed onto: `link` fails outright if the name is
-        // taken, where `rename` would replace it without a word.
+        // `link` fails outright if the name is taken; `rename` would replace it.
         if fs::hard_link(path, &kept).is_ok() {
             let _ = fs::remove_file(path);
             reap_quarantined(path, &kept);
@@ -355,56 +348,49 @@ fn quarantine(path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// How many quarantined databases are worth keeping. The newest is the one
-/// anybody would look at; older ones are copies of a file that was already
-/// unreadable, and each is as big as the database was.
 const KEEP_QUARANTINED: usize = 2;
 
-/// Drops the oldest quarantined copies. Without this every corruption left a
-/// full-sized file in the data directory for good, and the only thing that ever
-/// removed one was the user noticing.
-fn reap_quarantined(path: &Path, keep: &Path) {
-    // The stem, not the whole name: `with_extension` replaced `commands.bin`'s
-    // extension, so the copies are `commands.corrupt.<when>`.
-    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|n| n.to_str())) else {
-        return;
-    };
-    let prefix = format!("{stem}.corrupt.");
+/// Deletes the oldest matching files, keeping the newest `keep - 1` beside
+/// `keep_path`.
+pub(crate) fn reap(dir: &Path, keep_path: &Path, keep: usize, matches: impl Fn(&str) -> bool) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(&prefix))
-        })
-        .filter(|entry| entry.path() != keep)
+        .filter(|entry| entry.file_name().to_str().is_some_and(&matches))
+        .filter(|entry| entry.path() != keep_path)
         .filter_map(|entry| {
             let at = entry.metadata().and_then(|meta| meta.modified()).ok()?;
             Some((at, entry.path()))
         })
         .collect();
-    if found.len() < KEEP_QUARANTINED {
+    if found.len() < keep {
         return;
     }
     found.sort_unstable_by_key(|(at, _)| std::cmp::Reverse(*at));
-    for (_, stale) in found.drain(KEEP_QUARANTINED - 1..) {
+    for (_, stale) in found.drain(keep - 1..) {
         let _ = fs::remove_file(stale);
     }
+}
+
+fn reap_quarantined(path: &Path, keep: &Path) {
+    // The stem: `with_extension` replaced `commands.bin`'s extension.
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let prefix = format!("{stem}.corrupt.");
+    reap(dir, keep, KEEP_QUARANTINED, |name| {
+        name.starts_with(&prefix)
+    });
 }
 
 impl Store {
     pub fn open(path: &Path) -> Store {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
-            // No database yet is the ordinary first run. Anything else - a
-            // permission, a dangling symlink, one EMFILE - is a database that
-            // exists and could not be read, and starting empty there would
-            // rewrite it as empty at the next commit. Nothing that could not be
-            // read is ever written over.
+            // Missing is the first run. Anything else exists and could not be
+            // read, and starting empty would rewrite it as empty.
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Store::default(),
             Err(err) => return Store::unreadable(path, &err.to_string()),
         };
@@ -430,8 +416,7 @@ impl Store {
         }
     }
 
-    /// An empty store that refuses to be written. What the caller reads from it
-    /// is wrong, but wrong and recoverable beats right and destroyed.
+    /// An empty store that refuses to be written.
     fn unreadable(path: &Path, why: &str) -> Store {
         eprintln!("zcomplete: {}: {why}, leaving it alone", path.display());
         Store {
@@ -467,39 +452,49 @@ impl Store {
     }
 
     pub fn get(&self, name: &str) -> Option<&Entry> {
-        self.entries.iter().find(|e| e.name == name)
+        self.at_name.get(name).map(|found| &self.entries[*found])
     }
 
     pub fn is_ignored(&self, name: &str) -> bool {
         self.ignored.iter().any(|n| n == name)
     }
 
+    /// After anything that moved or dropped an entry. First position wins.
+    fn reindex(&mut self) {
+        self.at_name.clear();
+        self.total = 0.0;
+        for (found, entry) in self.entries.iter().enumerate() {
+            self.at_name.entry(entry.name.clone()).or_insert(found);
+            self.total += entry.rank;
+        }
+    }
+
     fn slot(&mut self, name: &str, kind: Kind, by: f32, at: u64) -> &mut Entry {
         self.dirty = true;
-        match self.entries.iter().position(|e| e.name == name) {
-            Some(found) => {
-                let entry = &mut self.entries[found];
-                entry.rank += by;
-                entry.last = entry.last.max(at);
-                entry
-            }
+        self.total += by;
+        let found = match self.at_name.get(name) {
+            Some(found) => *found,
             None => {
+                self.at_name.insert(name.to_owned(), self.entries.len());
                 self.entries.push(Entry {
                     name: name.to_owned(),
                     kind,
-                    rank: by,
+                    rank: 0.0,
                     last: at,
                 });
-                self.entries.last_mut().expect("just pushed")
+                self.entries.len() - 1
             }
-        }
+        };
+        let entry = &mut self.entries[found];
+        entry.rank += by;
+        entry.last = entry.last.max(at);
+        entry
     }
 
     pub fn bump(&mut self, name: &str, kind: Kind, by: f32) {
         self.absorb(name, kind, by, now());
     }
 
-    /// `bump` for something that happened earlier: the journal records when.
     pub fn absorb(&mut self, name: &str, kind: Kind, by: f32, at: u64) {
         self.slot(name, kind, by, at).kind = kind;
         self.age();
@@ -513,8 +508,8 @@ impl Store {
         self.age();
     }
 
-    /// Where every record of each scope starts in `raw`. One pass that reads a
-    /// scope id and steps over the rest, so nothing is allocated per word.
+    /// Where each scope's records start in `raw`, in one pass that allocates
+    /// nothing per word.
     fn index(&self) -> &HashMap<u64, Vec<u32>> {
         self.index.get_or_init(|| {
             let mut found: HashMap<u64, Vec<u32>> = HashMap::new();
@@ -544,26 +539,27 @@ impl Store {
         Some((name, rank, last))
     }
 
-    /// One scope, in memory if it has been written to and off disk otherwise.
-    fn words(&self, scope: u64) -> Ranks {
-        if let Some(words) = self.scoped.get(&scope) {
-            return words.clone();
+    /// One scope, borrowed if it is in memory and decoded off `raw` otherwise.
+    fn words(&self, scope: u64) -> Cow<'_, Ranks> {
+        match self.scoped.get(&scope) {
+            Some(words) => Cow::Borrowed(words),
+            None => Cow::Owned(
+                self.index()
+                    .get(&scope)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|start| self.record_at(*start))
+                    .map(|(name, rank, last)| (name.to_owned(), (rank, last)))
+                    .collect(),
+            ),
         }
-        self.index()
-            .get(&scope)
-            .into_iter()
-            .flatten()
-            .filter_map(|start| self.record_at(*start))
-            .map(|(name, rank, last)| (name.to_owned(), (rank, last)))
-            .collect()
     }
 
-    /// Pulls a scope out of `raw` so it can be written to. Records for it stay
-    /// in `raw` and are skipped at encode time, which is cheaper than rebuilding
-    /// the section every time one word changes.
+    /// Pulls a scope out of `raw` so it can be written to. Its records stay in
+    /// `raw` and are skipped at encode time.
     fn open_scope(&mut self, scope: u64) -> &mut Ranks {
         if !self.scoped.contains_key(&scope) {
-            let words = self.words(scope);
+            let words = self.words(scope).into_owned();
             self.scoped.insert(scope, words);
         }
         self.scoped.get_mut(&scope).expect("just inserted")
@@ -580,8 +576,7 @@ impl Store {
             .entry(name.to_owned())
             .or_insert((0.0, at));
         slot.0 += by;
-        // Never backwards: journal lines arrive out of order, and one from a
-        // shell that died last week must not age today's use.
+        // Never backwards: journal lines arrive out of order.
         slot.1 = slot.1.max(at);
         if self.scoped_len() > MAX_SCOPED {
             self.evict_scoped();
@@ -611,13 +606,13 @@ impl Store {
 
     pub fn in_scope(&self, scope: u64) -> Vec<Entry> {
         self.words(scope)
-            .into_iter()
+            .iter()
             .filter(|(name, _)| !name.starts_with(MARKER))
             .map(|(name, (rank, last))| Entry {
-                name,
+                name: name.clone(),
                 kind: Kind::External,
-                rank,
-                last,
+                rank: *rank,
+                last: *last,
             })
             .collect()
     }
@@ -628,8 +623,14 @@ impl Store {
         found
     }
 
+    /// Counted, not collected: `doctor` asks this of every command it knows.
     pub fn takes_verbs(&self, parent: &str) -> bool {
-        self.verbs(parent).len() >= VERBS_TO_QUALIFY
+        self.words(sub_scope(parent))
+            .iter()
+            .filter(|(name, (rank, _))| *rank >= VERB_CONFIDENCE && !name.starts_with(MARKER))
+            .take(VERBS_TO_QUALIFY)
+            .count()
+            >= VERBS_TO_QUALIFY
     }
 
     pub fn asked_for_help(&self, parent: &str) -> bool {
@@ -640,24 +641,26 @@ impl Store {
         self.bump_in(sub_scope(parent), ASKED, VERB_CONFIDENCE);
     }
 
+    /// Every bump checks this against the cap, so it counts the few open
+    /// scopes rather than the whole index.
     fn scoped_len(&self) -> usize {
-        let untouched: usize = self
-            .index()
-            .iter()
-            .filter(|(scope, _)| !self.scoped.contains_key(scope))
-            .map(|(_, starts)| starts.len())
+        let opened: usize = self
+            .scoped
+            .keys()
+            .map(|scope| self.index().get(scope).map_or(0, Vec::len))
             .sum();
-        untouched + self.scoped.values().map(HashMap::len).sum::<usize>()
+        self.raw_count.saturating_sub(opened)
+            + self.scoped.values().map(HashMap::len).sum::<usize>()
     }
 
-    /// Everything into memory. Only for the three callers that have to see every
-    /// scope at once, all of which are already rewriting the whole table.
+    /// Only for callers that must see every scope at once.
     fn materialise(&mut self) {
         let scopes: Vec<u64> = self.index().keys().copied().collect();
         for scope in scopes {
             self.open_scope(scope);
         }
         self.raw = Vec::new();
+        self.raw_count = 0;
         self.index.take();
     }
 
@@ -671,20 +674,23 @@ impl Store {
             dropped |= words.remove(name).is_some();
         }
         self.bindings.retain(|b| b.target != name);
-        // Only when something went. `forget nosuchcommand` marking the store
-        // dirty rewrote the whole file to say nothing had changed.
+        self.reindex();
+        // Only when something went, or `forget nosuchcommand` rewrites the
+        // whole file to say nothing changed.
         let now = (self.entries.len(), self.bindings.len());
         self.dirty |= dropped || now != before;
         self.entries.len() != before.0
     }
 
-    /// Bindings and the ignore list too: they are answers the database gives,
-    /// and leaving them behind made `forget --all` report an empty database
-    /// that still corrected things.
+    /// Bindings and the ignore list too, or `forget --all` reports an empty
+    /// database that still corrects things.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.at_name.clear();
+        self.total = 0.0;
         self.scoped.clear();
         self.raw = Vec::new();
+        self.raw_count = 0;
         self.index.take();
         self.bindings.clear();
         self.ignored.clear();
@@ -737,12 +743,8 @@ impl Store {
             }),
         }
         if self.bindings.len() > MAX_BINDINGS {
-            // Weight before recency. Accepting and refusing corrections both
-            // leave rows here, so ordinary use fills the table on its own, and
-            // sorting on age alone drops a `bind` the user typed by hand ahead
-            // of five hundred rows nobody asked for. Losing a pin is worse than
-            // it sounds: the word does not stop resolving, it starts resolving
-            // somewhere else.
+            // Weight before recency: ordinary use fills this table, and a
+            // lost pin does not stop resolving, it resolves somewhere else.
             self.bindings.sort_by_key(|b| {
                 (
                     std::cmp::Reverse(b.weight >= PINNED),
@@ -761,14 +763,14 @@ impl Store {
     }
 
     fn age(&mut self) {
-        let total: f32 = self.entries.iter().map(|e| e.rank).sum();
-        if total <= AGE_CEILING {
+        if self.total <= AGE_CEILING {
             return;
         }
         for entry in &mut self.entries {
             entry.rank *= AGE_FACTOR;
         }
         self.entries.retain(|e| e.rank >= AGE_FLOOR);
+        self.reindex();
     }
 
     fn evict_scoped(&mut self) {
@@ -804,10 +806,8 @@ impl Store {
         if !self.dirty || self.read_only {
             return Ok(());
         }
-        // Still made here, because `flock` failing outright on a network mount
-        // leaves nobody else to make it. A run that started before an `rm -rf`
-        // of the data directory does not get this far: the stale lock check in
-        // `commit` sends it home before it can put the database back.
+        // Still made here: `flock` failing on a network mount leaves nobody
+        // else to make it.
         if let Some(parent) = path.parent() {
             fs::DirBuilder::new()
                 .recursive(true)
@@ -847,8 +847,8 @@ impl Store {
         }
 
         put_u32(&mut out, self.scoped_len());
-        // Copied, not re-encoded: a scope nobody read is still exactly the bytes
-        // it arrived as, and rebuilding it would undo the point of not decoding.
+        // Copied, not re-encoded: a scope nobody read is the bytes it arrived
+        // as.
         for (scope, starts) in self.index() {
             if self.scoped.contains_key(scope) {
                 continue;
@@ -899,8 +899,7 @@ fn put_u32(out: &mut Vec<u8>, value: usize) {
     out.extend_from_slice(&(value as u32).to_le_bytes());
 }
 
-/// Cut rather than written with a wrapped length, which would desync the
-/// reader and lose the whole file.
+/// Cut rather than written with a wrapped length, which would desync the reader.
 fn put_str(out: &mut Vec<u8>, value: &str) {
     let mut end = value.len().min(u16::MAX as usize);
     while !value.is_char_boundary(end) {
@@ -993,8 +992,7 @@ fn decode(bytes: &[u8]) -> Field<Store> {
         });
     }
 
-    // Stepped over rather than read. `Store::index` walks it again on the first
-    // question anyone asks of it, and most runs ask about one scope.
+    // Stepped over, not read: `Store::index` walks it on the first question.
     let scoped_count = reader.count()?;
     let scoped_from = reader.at;
     for _ in 0..scoped_count {
@@ -1004,6 +1002,7 @@ fn decode(bytes: &[u8]) -> Field<Store> {
         reader.take(12)?;
     }
     store.raw = bytes[scoped_from..reader.at].to_vec();
+    store.raw_count = scoped_count;
 
     for _ in 0..reader.count()? {
         store.bindings.push(Binding {
@@ -1018,7 +1017,7 @@ fn decode(bytes: &[u8]) -> Field<Store> {
         store.ignored.push(reader.string()?);
     }
 
-    // Absent in a version 1 file, which is the point of putting it last.
+    // Absent in a version 1 file, which is why it is last.
     store.mode = reader
         .byte()
         .ok()
@@ -1026,26 +1025,23 @@ fn decode(bytes: &[u8]) -> Field<Store> {
         .unwrap_or_default();
     store.enabled = reader.byte().map_or(true, |byte| byte != 0);
 
-    match store.entries.iter().any(|e| !e.rank.is_finite()) {
-        true => Err(Broken::Garbled),
-        false => Ok(store),
+    if store.entries.iter().any(|e| !e.rank.is_finite()) {
+        return Err(Broken::Garbled);
     }
+    store.reindex();
+    Ok(store)
 }
 
-/// Closing the file releases the lock, so there is no `Drop` of our own and
-/// nothing to unlink.
+/// Closing the file releases the lock, so there is nothing to unlink.
 struct Lock {
     file: fs::File,
     path: PathBuf,
 }
 
 impl Lock {
-    /// Whether the file we locked is still the file at that name. Deleting the
-    /// data directory unlinks the lock without releasing it: we keep an
-    /// exclusive lock on an inode nobody can reach, the next process creates a
-    /// fresh lock file and takes it uncontested, and both write believing
-    /// themselves alone. Whoever commits second replaces the other's database
-    /// wholesale.
+    /// Deleting the data directory unlinks the lock without releasing it, so
+    /// the next process takes a fresh one and both write believing themselves
+    /// alone.
     fn current(&self) -> bool {
         use std::os::unix::fs::MetadataExt;
         let Ok(ours) = self.file.metadata() else {
@@ -1056,11 +1052,8 @@ impl Lock {
 }
 
 impl Lock {
-    /// `flock` rather than a sentinel file the first writer creates: the kernel
-    /// hands it back when the holder dies, so a killed shell leaves nothing for
-    /// the next one to guess about, and there is no unlink for two processes to
-    /// race. Waiting outright is only safe because no caller holds it across a
-    /// prompt; every one of them commits first and asks afterwards.
+    /// `flock`, so a killed shell leaves nothing to guess about. Waiting
+    /// outright is safe only because no caller holds it across a prompt.
     fn take(db: &Path) -> Option<Lock> {
         let path = db.with_extension("lock");
         let mut made_dir = false;
@@ -1196,6 +1189,65 @@ mod tests {
             kept <= KEEP_QUARANTINED,
             "{kept} quarantined copies kept, expected at most {KEEP_QUARANTINED}"
         );
+    }
+
+    #[test]
+    fn the_index_and_the_row_count_agree_with_the_long_way_round() {
+        let path = scratch("invariants");
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let check = |store: &Store| {
+            for (found, entry) in store.entries.iter().enumerate() {
+                let first = store.entries.iter().position(|e| e.name == entry.name);
+                assert_eq!(
+                    store.at_name.get(&entry.name).copied(),
+                    first,
+                    "{}",
+                    entry.name
+                );
+                let _ = found;
+            }
+            let summed: f32 = store.entries.iter().map(|e| e.rank).sum();
+            assert!(
+                (store.total - summed).abs() < 0.5,
+                "{} vs {summed}",
+                store.total
+            );
+            let rows = decode(&store.encode()).ok().expect("re-readable");
+            assert_eq!(rows.raw_count, store.scoped_len(), "row count is wrong");
+        };
+
+        let mut store = edit(&path);
+        for round in 0..600u64 {
+            let name = format!("cmd{}", next() % 40);
+            match next() % 6 {
+                0 => {
+                    store.forget(&name);
+                }
+                1 => store.bump_in(next() % 7, &name, 1.0),
+                2 => store.bump_in(sub_scope("git"), &name, 2.0),
+                3 => store.nudge_binding(&name, "git", 1),
+                _ => store.bump(&name, Kind::External, 1.0),
+            }
+            if round % 97 == 0 {
+                store.touch();
+                // Dropped first: `edit` waits on a lock this process still holds.
+                store = {
+                    let saved = store.commit().unwrap();
+                    drop(saved);
+                    edit(&path)
+                };
+            }
+            check(&store);
+        }
+        store.touch();
+        store.commit().unwrap();
+        check(&Store::open(&path));
     }
 
     #[test]

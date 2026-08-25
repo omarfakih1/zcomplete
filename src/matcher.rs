@@ -106,9 +106,7 @@ impl<'a> Context<'a> {
     }
 }
 
-/// A thing worth scoring, borrowed. The names off `PATH` are slices of one
-/// cached buffer, and wrapping each in an owned `Entry` to score it cost more
-/// than the scoring did.
+/// Borrowed: the names off `PATH` are slices of one cached buffer.
 pub struct Candidate<'a> {
     pub name: &'a str,
     pub kind: Kind,
@@ -131,9 +129,7 @@ pub fn rank(query: &str, ctx: &Context) -> Vec<Hit> {
     among(query, ctx.store.entries.iter().map(Candidate::from), ctx)
 }
 
-/// The query, measured once. Its length, its budget and the letters it uses
-/// were being worked out again for every command in the store, which on the
-/// fallback sweep is every name on `PATH`.
+/// The query, measured once instead of per candidate.
 struct Probe<'a> {
     text: &'a str,
     len: usize,
@@ -142,11 +138,9 @@ struct Probe<'a> {
     opens_with: Option<char>,
 }
 
-/// The bit each byte stands for. Everything outside `a-z0-9` and the separators
-/// shares the last one, and two letters that share a bit read as the same
-/// letter - so a word can look more like a candidate than it is, never less.
-/// The test built on this may only ever be allowed to keep a candidate it
-/// should have dropped.
+/// The bit each byte stands for. Bytes outside `a-z0-9` and the separators
+/// share the last one, so a word can look more like a candidate than it is,
+/// never less: the test below may only keep what it should have dropped.
 static LETTER_BIT: [u32; 256] = {
     let mut table = [1u32 << 31; 256];
     let mut byte = 0usize;
@@ -167,8 +161,6 @@ static LETTER_BIT: [u32; 256] = {
     table
 };
 
-/// One bit per letter used. A table rather than a `match`, because this runs
-/// over every byte of every name in the store for every word that fails.
 fn letters_of(word: &str) -> u32 {
     word.bytes()
         .fold(0u32, |letters, byte| letters | LETTER_BIT[byte as usize])
@@ -186,23 +178,19 @@ impl<'a> Probe<'a> {
         }
     }
 
-    /// How many of the query's letters the candidate does not have at all.
-    /// Cheaper than any of the four tests it stands in front of, and it answers
-    /// both of the questions those tests would have had to walk the word to
-    /// answer: past the typo budget nothing can match, and above zero a prefix,
-    /// a run of initials and a subsequence are all already out - each of those
-    /// needs every letter, wherever it sits.
+    /// Query letters the candidate does not have at all. Past the typo budget
+    /// nothing matches, and above zero the other three tiers are out too.
     fn missing_from(&self, candidate: &str) -> usize {
         (self.letters & !letters_of(candidate)).count_ones() as usize
     }
 }
 
 pub fn among<'a>(
-    query: &str,
+    typed: &str,
     entries: impl Iterator<Item = Candidate<'a>>,
     ctx: &Context,
 ) -> Vec<Hit> {
-    let query = lower(query);
+    let query = lower(typed);
     let probe = Probe::new(&query);
     let key = ctx.learned_as(&query);
     let learned: Vec<&Binding> = ctx
@@ -216,7 +204,9 @@ pub fn among<'a>(
     let mut hits: Vec<Hit> = Vec::new();
 
     for entry in entries {
-        if entry.name == query.as_ref() || !entry.kind.usable_in(ctx.shell) {
+        // What was typed, not its lowercase: the shell could not run `GS`, and
+        // the `gs` it excluded is the answer.
+        if entry.name == typed || !entry.kind.usable_in(ctx.shell) {
             continue;
         }
         if ignored && ctx.under.is_none() && ctx.store.is_ignored(entry.name) {
@@ -241,8 +231,8 @@ pub fn among<'a>(
             kind: entry.kind,
             tier: found.tier,
             speculative: found.speculative,
-            // Logarithmic on purpose: multiplied in directly, a much-used command wins
-            // from far away; left out, an unused binary wins on spelling alone.
+            // Logarithmic: multiplied in directly a much-used command wins
+            // from far away, left out an unused binary wins on spelling.
             score: (1.0 + base.max(0.0).ln_1p()) * found.similarity * (1.0 + 0.5 * confirmed),
             rank: base,
             distance: found.distance,
@@ -253,8 +243,7 @@ pub fn among<'a>(
     hits
 }
 
-/// Score, not tier: ordering by tier makes a prefix of anything outrank a
-/// transposition of the command you run all day, and `gti` becomes `gtimeout`.
+/// Score, not tier, or `gti` becomes `gtimeout`.
 pub fn sort(hits: &mut [Hit]) {
     hits.sort_by(|a, b| {
         a.speculative
@@ -265,8 +254,6 @@ pub fn sort(hits: &mut [Hit]) {
     });
 }
 
-/// What one candidate turned out to be, once the query had been spelled
-/// against it.
 struct Match {
     tier: Tier,
     similarity: f32,
@@ -289,9 +276,8 @@ fn classify(probe: &Probe, candidate: &str) -> Option<Match> {
     if probe.text.is_empty() || candidate.is_empty() {
         return None;
     }
-    // Bytes are never fewer than the letters they spell, so a candidate too
-    // short by this count is too short by any count. Before the scans, because
-    // it is the only test here that reads none of the word.
+    // Bytes are never fewer than the letters they spell, and this is the only
+    // test that reads none of the word.
     if probe.len > candidate.len() + probe.allowed {
         return None;
     }
@@ -305,9 +291,7 @@ fn classify(probe: &Probe, candidate: &str) -> Option<Match> {
     if qlen > clen + probe.allowed {
         return None;
     }
-    // Every letter accounted for, so the three tiers that ask where the letters
-    // sit are worth asking. One letter short and they cannot match however they
-    // are arranged, and a typo is the only reading left.
+    // One letter short and a typo is the only reading left.
     let spelled = missing == 0;
 
     if spelled && lower.starts_with(probe.text) {
@@ -323,10 +307,8 @@ fn classify(probe: &Probe, candidate: &str) -> Option<Match> {
         }
     }
 
-    // A two-letter word gets no typo budget, because one substitution reaches a
-    // dozen real commands. Its one transposition is not a guess: both letters
-    // are the ones you typed, and there is only ever one candidate. Scored at
-    // the floor so a deliberate abbreviation still reads first.
+    // No typo budget at two letters, but a transposition is not a guess:
+    // both letters are yours and there is only ever one candidate.
     if probe.allowed == 0 && transposed(probe.text, &lower) {
         return Some(Match {
             tier: Tier::Typo,
@@ -349,16 +331,10 @@ fn classify(probe: &Probe, candidate: &str) -> Option<Match> {
                 probe.opens_with == lower.chars().next(),
             ),
             distance,
-            // Two edits away is a different word, or twelve uses of `chmod` beat
-            // the `chown` behind `chwon`. One edit is read by which way the
-            // length went, because the two are not the same mistake. A letter
-            // short is a key missed, and the longer name is the only word it
-            // could have been: `ocker` is `docker`. A letter over is a word you
-            // typed more of than the candidate has, and cutting it down to a
-            // shorter command is a guess - which is what keeps `rmd` on `rmdir`
-            // rather than on `rm`, where being wrong deletes something. A
-            // doubled letter is the exception both ways: every letter you meant
-            // is still there, in order.
+            // One edit is read by which way the length went. A letter short
+            // is a key missed, `ocker` is `docker`. A letter over means
+            // cutting down to a shorter command, which is a guess - that keeps
+            // `rmd` on `rmdir` rather than `rm`. A doubled letter is neither.
             speculative: distance > 1 || (qlen > clen && !stutter(probe.text, &lower)),
         }
     };
@@ -373,8 +349,6 @@ fn classify(probe: &Probe, candidate: &str) -> Option<Match> {
     (distance <= probe.allowed).then(|| typo(distance))
 }
 
-/// Characters, without walking the string when the bytes already are the
-/// characters. Command names are ASCII almost to a name.
 fn count(word: &str) -> usize {
     match word.is_ascii() {
         true => word.len(),
@@ -382,9 +356,7 @@ fn count(word: &str) -> usize {
     }
 }
 
-/// `lls` for `ls`, `gss` for `gs`. Holding a key a beat too long is the ordinary
-/// typo, and unlike a deletion in general it leaves every letter you meant where
-/// you put it, so frecency is allowed to decide.
+/// `lls` for `ls`. A held key leaves every letter you meant where you put it.
 fn stutter(query: &str, candidate: &str) -> bool {
     let mut letters = query.char_indices().peekable();
     while let Some((at, ch)) = letters.next() {
@@ -401,7 +373,7 @@ fn stutter(query: &str, candidate: &str) -> bool {
     false
 }
 
-/// `sl` for `ls`, `vm` for `mv`. Two letters, both right, in the wrong order.
+/// `sl` for `ls`. Two letters, both right, in the wrong order.
 fn transposed(query: &str, candidate: &str) -> bool {
     let (mut typed, mut real) = (query.chars(), candidate.chars());
     match (typed.next(), typed.next(), typed.next()) {
@@ -414,11 +386,8 @@ fn transposed(query: &str, candidate: &str) -> bool {
 
 fn typo_quality(distance: usize, qlen: usize, clen: usize, starts_alike: bool) -> f32 {
     let accuracy = 1.0 - distance as f32 / qlen as f32;
-    // Same length is a substitution or a swap, and every letter meant is there.
-    // One letter out, by one edit, is a single slip as well - a key missed or a
-    // key hit twice - and reading it as one guess among many was the whole of
-    // why `ocker` found `docker-compose` instead of `docker`. Further apart
-    // than that and the word really is more guess than typo.
+    // Same length is a substitution or a swap, one letter out by one edit is
+    // still a single slip. Further apart and it is more guess than typo.
     let agrees = match clen.abs_diff(qlen) {
         0 => 1.05,
         1 if distance == 1 => 0.75,
@@ -484,10 +453,7 @@ fn subsequence_match(query: &str, candidate: &str) -> Option<f32> {
     }
 
     let density = matched as f32 / (end - first).max(1) as f32;
-    // How much of the word the letters actually account for, as well as how
-    // tightly they sit. Density alone reads a run buried in a long name as
-    // perfect - `iff` is flawlessly dense inside `ifconfig` - and that beat the
-    // one dropped letter that makes it `diff`.
+    // Density alone reads a buried run as perfect: `iff` inside `ifconfig`.
     let coverage = matched as f32 / length.max(1) as f32;
     let anchored = if first == 0 { 0.12 } else { 0.0 };
     let boundary_bonus = 0.10 * (boundaries as f32 / matched as f32);
@@ -496,9 +462,7 @@ fn subsequence_match(query: &str, candidate: &str) -> Option<f32> {
 
 /// Optimal string alignment, so `gti` -> `git` is one edit, not two.
 pub fn edit_distance(a: &str, b: &str, limit: usize) -> usize {
-    // Bytes when the bytes are the letters, which for command names is all but
-    // always: the copy into a buffer of `char` was the whole cost of the short
-    // words this is called on.
+    // The copy into a `char` buffer was the whole cost of a short word.
     if a.is_ascii() && b.is_ascii() {
         return between(a.as_bytes(), b.as_bytes(), limit);
     }
@@ -753,6 +717,18 @@ mod tests {
     }
 
     #[test]
+    fn a_word_typed_in_the_wrong_case_still_finds_its_command() {
+        let mut store = Store::default();
+        store.bump("gs", Kind::Shell(Shell::Zsh), 50.0);
+        let ctx = Context::new(&store, 0, Some(Shell::Zsh));
+        assert_eq!(
+            rank("GS", &ctx).first().map(|h| h.name.as_str()),
+            Some("gs")
+        );
+        assert!(rank("gs", &ctx).iter().all(|h| h.name != "gs"));
+    }
+
+    #[test]
     fn a_word_two_edits_away_never_wins_over_one_a_single_edit_away() {
         let store = store_with(&[("chmod", 400.0), ("chown", 0.0)]);
         assert_eq!(best("chwon", &store).as_deref(), Some("chown"));
@@ -767,9 +743,8 @@ mod tests {
         assert_eq!(best("kbctl", &store).as_deref(), Some("kubectl"));
     }
 
-    /// The keys either side of one, on a US QWERTY board. Typos are a hand
-    /// missing by a key far more often than they are a random letter, so a
-    /// corpus built from anything else measures a mistake nobody makes.
+    /// The keys either side of one, on a US QWERTY board. A corpus of random
+    /// letters would measure a mistake nobody makes.
     fn neighbours(ch: char) -> &'static str {
         match ch {
             'q' => "wa",
@@ -811,7 +786,6 @@ mod tests {
         }
     }
 
-    /// The commands a working machine actually has, most-used first.
     const CORPUS: &[&str] = &[
         "git",
         "ls",
@@ -915,13 +889,11 @@ mod tests {
     fn corpus_store() -> Store {
         let mut store = Store::default();
         for (i, name) in CORPUS.iter().enumerate() {
-            // Zipf-ish, so the head of the list is the head of the day.
             store.bump(name, Kind::External, 400.0 / (i + 1) as f32);
         }
         store
     }
 
-    /// Every typo one slip of the hand makes of `name`, at every position.
     fn slips(name: &str) -> Vec<String> {
         let letters: Vec<char> = name.chars().collect();
         let mut out = Vec::new();
@@ -951,9 +923,7 @@ mod tests {
         out
     }
 
-    /// Share of slips whose command comes back first, and within the first
-    /// three. A slip that reads as some other real command is left out: there
-    /// is no right answer to measure there.
+    /// Share of slips whose command comes back first, and in the first three.
     fn recovery(store: &Store) -> (f32, f32, usize) {
         let ctx = Context::new(store, 0, None);
         let (mut first, mut near, mut total) = (0usize, 0usize, 0usize);
@@ -1003,11 +973,8 @@ mod tests {
             near,
             total - (near * total as f32).round() as usize,
         );
-        // A floor just under where it stands, not a target. Two words a letter
-        // apart are two words, and no ranking gets all of those right - what is
-        // left wrong here is mostly `dd` for `df` and `hq` for `jq`, which have
-        // no right answer. What this catches is a change that quietly trades
-        // away the ones it does get.
+        // A floor just under where it stands, not a target. This catches a
+        // change that quietly trades away the ones it does get.
         assert!(first >= 0.955, "top-1 recovery fell to {first:.4}");
         assert!(near >= 0.985, "top-3 recovery fell to {near:.4}");
     }
@@ -1016,9 +983,7 @@ mod tests {
     #[ignore = "a measurement, not a check: cargo test --release -- --ignored --nocapture"]
     fn how_long_one_failed_word_takes() {
         use std::time::Instant;
-        // The fallback sweep scores every name on `PATH`, so the worst case is
-        // a word that matches nothing and is spelled against all of them. A
-        // word shorter than MIN_INPUT never gets here, so none is measured.
+        // Worst case: a word that matches nothing, spelled against every name.
         let mut store = corpus_store();
         for i in 0..2_000 {
             store.bump(&format!("pkg-tool-{i:04}"), Kind::External, 1.0);
