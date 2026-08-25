@@ -118,7 +118,8 @@ inside a project and `man` everywhere else.
 
 A typed word is matched four ways: prefix (`mkd` → `mkdir`), initials (`dc` →
 `docker-compose`), subsequence (`dkr` → `docker`) and typo (`gti` → `git`,
-`sl` → `ls`). Match quality decides the winner and usage only breaks ties.
+`sl` → `ls`). Case is ignored throughout, so a stuck shift key (`GIT`) resolves
+like anything else. Match quality decides the winner and usage only breaks ties.
 Sorting the other way round makes `gti` mean `gtimeout`.
 
 Two things hold in every mode, `bypass` included:
@@ -180,18 +181,29 @@ zcomplete doctor                 check the installation
 ## Speed
 
 A command that worked needs no correction, so nothing starts for it. The hook
-appends one line to a per-session file using only shell builtins. Per command,
-on an M-series Mac:
+appends one line to a per-session file. Per command, on an M-series Mac:
 
 ```
-zsh, bash               0.067 ms
-fish                    0.15  ms
-starting any process    1.4   ms   (for comparison)
+zsh                     0.07 ms
+fish                    0.21 ms
+bash                    0.60 ms
+a command substitution  0.51 ms   (for comparison)
+starting any process    1.6  ms   (for comparison)
 ```
 
-When a correction is actually needed, 2000 learned commands and 4257 executables
-on `PATH` put the whole run at 2.2-2.7 ms, against a 1.9 ms floor for a Rust
-binary that does nothing. Under a millisecond of that is zcomplete's own work.
+zsh is the cheap one because nothing on its path forks: the command line comes
+from `preexec` and is split by parameter expansion. fish pays for two hooks, one
+to rewrite the line at enter and one to count it afterwards, but both are
+builtins. bash has no `preexec` at all, so the only way to see what you typed is
+`$(history 1)`, and bash forks for a command substitution — that fork is almost
+the whole 0.60 ms and no amount of tuning removes it.
+
+When a correction is actually needed, 2000 learned commands and 4302 executables
+on `PATH` put the whole run at 2.8-3.3 ms, against 2.3 ms for the same binary
+printing its version. Under a millisecond of that is zcomplete's own work.
+
+`zcomplete import` is the one command you wait on: about 0.7 s for a 20,000-line
+history. It runs once.
 
 ## Disk
 
@@ -207,9 +219,6 @@ has a ceiling:
 | `commands.corrupt.*` | a database that wouldn't read, kept in case you want it | the 2 most recent |
 
 Twelve different `PATH`s and 2000 learned commands come to 48 KB.
-
-The `PATH` listings used to have no ceiling, and every distinct `PATH` left one
-behind for good. Ten venvs meant ten copies, kept for ever. Fixed.
 
 The database holds command names. Never arguments. It's mode 0600 in a directory
 created 0700.

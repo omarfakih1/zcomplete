@@ -533,6 +533,22 @@ def multiline_survives(sc):
     assert not (sc.home / "mkd").exists(), "a command word was consumed as an argument"
 
 
+@check("a newline in the directory name is mangled, not dropped")
+def newline_in_the_directory(sc):
+    sc.mode("bypass")
+    (sc.home / "two\nlines").mkdir(exist_ok=True)
+    # fish escapes backslashes outside quotes; zsh and bash need $'...'.
+    target = "two\\nlines" if sc.kind == "fish" else "$'two\\nlines'"
+    sc.session.run(f"cd {target}", timeout=8)
+    sc.session.run("grep --version", timeout=8)
+    lines = []
+    for journal in sc.data.glob("journal.*"):
+        lines += journal.read_text(errors="replace").splitlines()
+    recorded = [line for line in lines if " grep " in f" {line} "]
+    assert recorded, f"nothing was journalled from that directory: {lines}"
+    assert any(line.rstrip().endswith("two?lines") for line in recorded), recorded
+
+
 @check("an open prompt does not stall other shells")
 def a_prompt_does_not_hold_the_database(sc):
     if sc.kind != "zsh":

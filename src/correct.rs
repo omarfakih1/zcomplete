@@ -27,9 +27,8 @@ pub(crate) fn resolve(args: &[String]) -> Result<i32, Fail> {
         subshell: flags.iter().any(|f| f == "--subshell"),
     };
     match decide(word, &operands[1..], shell, alone)? {
-        // Line one is the command. Line two, when the subcommand is corrected too,
-        // is `verb <word>`: the shell splices that over its own first argument, so
-        // the rest of its array never passes through us.
+        // Line two, when there is one, is `verb <word>`: the shell splices it
+        // over its own first argument.
         Outcome::Run(fixed) => {
             let mut out = std::io::stdout();
             writeln!(out, "{}", fixed.word)?;
@@ -42,8 +41,6 @@ pub(crate) fn resolve(args: &[String]) -> Result<i32, Fail> {
         Outcome::Nothing => Ok(NO_MATCH),
         Outcome::Declined => Ok(DECLINED),
         Outcome::Disabled => Ok(DISABLED),
-        // Nothing printed and nothing asked. The hook returns this untouched,
-        // which is how the next prompt learns to do the correction itself.
         Outcome::Deferred => Ok(DEFERRED),
     }
 }
@@ -55,7 +52,7 @@ pub(crate) fn retry(args: &[String]) -> Result<i32, Fail> {
     let line = operands.join(" ");
     let borrowed = flags.iter().any(|f| f == "--inline");
     // Which words the shell could not run. Without it we would "fix" its own
-    // builtins, which are not on PATH: fish's `set` is one edit from `sed`.
+    // builtins: fish's `set` is one edit from `sed`.
     let only: Vec<String> = flag_value(&flags, "--only")
         .map(|list| list.split(',').map(str::to_owned).collect())
         .unwrap_or_default();
@@ -70,8 +67,7 @@ pub(crate) fn retry(args: &[String]) -> Result<i32, Fail> {
         if !only.is_empty() && !only.iter().any(|name| name == word) {
             continue;
         }
-        // Quotes stripped, or the danger table reads `docker "rm" x` as an
-        // argument it has never heard of and waves it through.
+        // Quotes stripped, or the danger table waves `docker "rm" x` through.
         let rest: Vec<String> = line[word_end..end]
             .split_whitespace()
             .map(|arg| arg.trim_matches(|c| c == '"' || c == '\'').to_owned())
@@ -118,8 +114,7 @@ fn first_argument(line: &str, from: usize, to: usize) -> Option<(usize, usize)> 
     Some((start, start + word.len()))
 }
 
-/// A corrected line is `eval`'d by the shell, so only a plain word may ever be
-/// spliced in. Nothing reaches the subcommand table without passing here.
+/// A corrected line is `eval`'d, so only a plain word may ever be spliced in.
 pub(crate) fn is_verb(word: &str) -> bool {
     !word.is_empty()
         && !word.starts_with('-')
@@ -132,9 +127,8 @@ fn plausible_verb(word: &str) -> bool {
     is_verb(word) && word.len() <= 24 && !std::path::Path::new(word).exists()
 }
 
-/// The same rule for the command word, which comes off PATH and so is whatever
-/// someone named a file. Wider than `is_verb` because `python3.11` and `g++`
-/// are real programs, but still nothing a shell would read as punctuation.
+/// Wider than `is_verb`, since `python3.11` and `g++` are real programs, but
+/// still nothing a shell would read as punctuation.
 pub(crate) fn is_plain_name(word: &str) -> bool {
     !word.is_empty()
         && !word.starts_with(['-', '~'])
@@ -149,9 +143,8 @@ pub(crate) struct Call<'a> {
     args: Vec<String>,
 }
 
-/// Correcting a verb means running the line again, and in `cp a b; git sttaus`
-/// the copy already happened. A lone command that failed on its verb did
-/// nothing, which is what makes the rerun safe.
+/// Correcting a verb reruns the line, and in `cp a b; git sttaus` the copy
+/// already happened. A lone command that failed on its verb did nothing.
 fn subcommand_call(line: &str) -> Option<Call<'_>> {
     let [span] = commands_in(line)[..] else {
         return None;
@@ -224,11 +217,8 @@ fn worth_asking(db_store: &Store, parent: &str, typed: &str) -> bool {
         && is_verb(typed)
         && typed.chars().count() >= MIN_INPUT
         && shell::on_path(parent)
-        // `--help` is a question, not an instruction, but that is the command's
-        // word for it and not ours. For the handful whose ordinary use costs
-        // something you cannot get back, the subcommands are not worth finding
-        // out by running the thing. Everything else - `git`, `cargo`, `docker` -
-        // is still asked, which is what makes `git sttaus` work on day one.
+        // Where running it costs something you cannot get back, its
+        // subcommands are not worth finding out.
         && crate::safety::inspect(parent, &["--help".to_owned()]).is_none()
 }
 
@@ -323,9 +313,8 @@ impl Line<'_> {
 struct Caller<'a> {
     line: Option<Line<'a>>,
     borrowed: bool,
-    /// zsh and bash both run their not-found hook in a fork, so a correction to
-    /// an alias or a function is executed and then thrown away with the child.
-    /// Those are handed back for the real shell to run at the next prompt.
+    /// zsh and bash run their not-found hook in a fork, which throws away what
+    /// an alias or function did. Those go back for the next prompt to run.
     subshell: bool,
 }
 
@@ -364,12 +353,10 @@ fn decide(
     }
 
     let db = store::db_path();
-    // Read unlocked: holding the database across a prompt would queue every
-    // other shell's hook behind one keypress. The increments re-open it locked.
+    // Read unlocked: holding it across a prompt would queue every other
+    // shell's hook behind one keypress. The increments re-open it locked.
     let mut db_store = Store::open(&db);
-    // Read, not taken: a command typed a moment ago is exactly the one being
-    // corrected now, and waiting for a flush to notice it would be absurd. The
-    // lines stay where they are for whoever next holds the write lock.
+    // Read, not taken: they stay for whoever next holds the write lock.
     for (text, at) in pending() {
         apply(&mut db_store, &text, at);
     }
@@ -390,8 +377,7 @@ fn decide(
     if hits.is_empty() {
         return Ok(Outcome::Nothing);
     }
-    // Before the question, not after: asking here and handing the answer back
-    // would ask the same question twice, once in the fork and once for real.
+    // Before the question, or it gets asked twice.
     if caller.subshell && matches!(hits[0].kind, Kind::Shell(_)) {
         return Ok(Outcome::Deferred);
     }
@@ -407,8 +393,8 @@ fn decide(
             })
         });
 
-    // `u` swaps the subcommand as well, and the danger table has to see the one
-    // that will run: `docker imgae prne` is a prune however it was spelled.
+    // The danger table has to see the line that will run: `docker imgae prne`
+    // is a prune however it was spelled.
     let corrected: Option<Vec<String>> = also.as_ref().map(|also| {
         let mut args = rest.to_vec();
         args[0] = also.fixed.clone();
@@ -461,8 +447,7 @@ fn decide(
     }))
 }
 
-/// The preexec hook never saw this command, because what was typed did not
-/// exist. Except in fish, where it did, and counting here would count twice.
+/// The preexec hook never saw this command. Except in fish, where it did.
 fn remember(db_store: &mut Store, word: &str, target: &str, dir: u64, shell_will_count: bool) {
     if !shell_will_count {
         let kind = db_store
@@ -475,9 +460,8 @@ fn remember(db_store: &mut Store, word: &str, target: &str, dir: u64, shell_will
 }
 
 fn candidates(word: &str, ctx: &Context, pinned: Option<&str>, keep: usize) -> Vec<matcher::Hit> {
-    // `runnable` stats PATH, so this costs a syscall sweep per candidate asked.
-    // Two bounds, because either alone has a bad case. The list is sorted, so a
-    // survivor past PROBES was never going to be shown.
+    // `runnable` stats PATH, so this costs a sweep per candidate asked. The
+    // list is sorted, so a survivor past PROBES was never going to be shown.
     let mut hits: Vec<matcher::Hit> = matcher::rank(word, ctx)
         .into_iter()
         .take(PROBES)
@@ -487,8 +471,6 @@ fn candidates(word: &str, ctx: &Context, pinned: Option<&str>, keep: usize) -> V
 
     let only_guesses = hits.iter().all(matcher::Hit::is_speculative);
     if (hits.is_empty() || only_guesses) && pinned.is_none() {
-        // Scored straight off the cached listing: these are slices of one
-        // buffer, and only the few that survive are ever copied.
         let mut found = matcher::among(
             word,
             shell::path_names(|name| plausibly_installed(word, name)).map(|name| {
@@ -507,9 +489,7 @@ fn candidates(word: &str, ctx: &Context, pinned: Option<&str>, keep: usize) -> V
             _ => false,
         });
         found.retain(|hit| !hits.iter().any(|known| known.name == hit.name));
-        // Installed before cut, not after: the listing can name something that
-        // has since been removed, and a dead name must not take a live one's
-        // place. Bounded by the same `take` the store side uses.
+        // Installed before cut: a dead name must not take a live one's place.
         found.truncate(PROBES);
         found.retain(|hit| shell::on_path(&hit.name));
         found.truncate(MAX_CANDIDATES);
@@ -561,14 +541,12 @@ enum Choice {
         at: usize,
         and_verb: bool,
     },
-    /// Which candidate was turned down, so the menu does not bury the one at
-    /// the top when the answer was about the fourth.
+    /// Which candidate was turned down.
     No(usize),
     Silent,
 }
 
-/// Every mode goes through here, so exactly one place can run something
-/// without asking.
+/// Every mode goes through here, so one place decides what runs unasked.
 fn confirm(mode: Mode, proposal: &Proposal) -> Choice {
     let Some(mut tty) = term::Tty::open_as(proposal.borrowed) else {
         return Choice::Silent;
@@ -586,8 +564,8 @@ fn confirm(mode: Mode, proposal: &Proposal) -> Choice {
         Mode::Bypass => false,
     };
     if !must_ask {
-        // Not when the line editor is still drawing: the notice would go to an
-        // alternate screen that is discarded the moment this returns.
+        // Not while the line editor is drawing: the alternate screen it would
+        // land on is discarded the moment this returns.
         if mode == Mode::Unsafe && !proposal.borrowed {
             let notice = format!("zcomplete: {} -> {}\n", proposal.typed, hits[0].name);
             tty.say(&tty.paint("2", &notice));
@@ -730,11 +708,10 @@ fn runnable(kind: Kind, name: &str, shell: Option<Shell>) -> bool {
 ///
 ///     <seconds> <kind> <word> <verb> <directory>
 ///
-/// Space separated with the one free-form field last, so a path with spaces in
-/// it still parses. Never an argument, only ever the first two words. One file
-/// per shell session, so a line has exactly one writer.
-/// Every journal, left where it is. The read paths want to see what has been
-/// typed without taking the write lock to find out.
+/// Space separated with the free-form field last, so a path with spaces still
+/// parses. One file per shell session, so a line has exactly one writer.
+///
+/// This reads every journal and leaves it where it is.
 pub(crate) fn pending() -> Vec<(String, u64)> {
     let dir = store::data_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -752,9 +729,7 @@ pub(crate) fn pending() -> Vec<(String, u64)> {
     found
 }
 
-/// When a journal was last appended to. fish has no clock builtin, so its lines
-/// carry no time of their own and lean on this instead: every line in one file
-/// is dated by its last write, which is at most one flush out.
+/// fish has no clock builtin, so its lines are dated by this instead.
 fn written(path: &std::path::Path) -> u64 {
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())
@@ -767,7 +742,6 @@ fn is_journal(name: &str) -> bool {
     name.starts_with("journal.") && folding_owner(name).is_none()
 }
 
-/// The pid in `journal.<session>.folding.<pid>`, for a name that is one.
 fn folding_owner(name: &str) -> Option<u32> {
     let (head, pid) = name.rsplit_once('.')?;
     (head.starts_with("journal.") && head.ends_with(".folding"))
@@ -775,25 +749,21 @@ fn folding_owner(name: &str) -> Option<u32> {
         .flatten()
 }
 
-/// Whether a process still exists. Signal 0 asks without sending anything, and
 /// `EPERM` is somebody else's process rather than a free pid.
 fn alive(pid: u32) -> bool {
     let answer = unsafe { libc::kill(pid as libc::pid_t, 0) };
     answer == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
 }
 
-/// An empty journal back at `name`, 0600, for the session still appending to
-/// it. Only while that session is alive: one belonging to a shell that has gone
-/// would be made again at every fold and never taken away.
+/// An empty journal back at `name`, 0600. Only while its session is alive, or
+/// a dead shell's would be remade at every fold and never taken away.
 fn replace(dir: &std::path::Path, name: &str) {
     use std::os::unix::fs::OpenOptionsExt;
     let owner = name.rsplit('.').next().and_then(|pid| pid.parse().ok());
     if !owner.is_some_and(alive) {
         return;
     }
-    // `create_new`, so a shell that got its append in first keeps the file it
-    // made. That one is the wrong mode until the next fold, which is a window
-    // rather than the permanent state this exists to prevent.
+    // `create_new`, so a shell that got its append in first keeps its file.
     let _ = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -801,19 +771,14 @@ fn replace(dir: &std::path::Path, name: &str) {
         .open(dir.join(name));
 }
 
-/// Every journal, taken. Only for a caller that holds the write lock and is
-/// about to save what it absorbed.
+/// Every journal, taken. Only for a caller holding the write lock.
 ///
-/// The files come back rather than going away. A journal unlinked before the
-/// database it fed has landed is a session's worth of counts lost to one power
-/// cut or one full disk, so `discard` gets them once `commit` has returned.
+/// The files come back rather than going away: one unlinked before the database
+/// it fed has landed is a session's counts lost. `commit_taking` deletes them.
 #[must_use]
 pub(crate) fn fold(writing: &mut store::Editing) -> Vec<std::path::PathBuf> {
-    // Without the lock another process is rewriting the same file; with
-    // corrections off `apply` would drop every line it read; and a database we
-    // are not allowed to write is one whose counts have nowhere to land. Either
-    // way these are somebody else's to fold, and taking them would only lose
-    // them.
+    // No lock, corrections off, or read-only: the counts have nowhere to land,
+    // and taking the journals would only lose them.
     if !writing.locked() || !writing.enabled() || writing.is_read_only() {
         return Vec::new();
     }
@@ -828,31 +793,22 @@ pub(crate) fn fold(writing: &mut store::Editing) -> Vec<std::path::PathBuf> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        // Renamed before it is read: a shell appending at that moment opens the
-        // path afresh and writes to a new file, so nothing is read twice or lost
-        // beyond the single line already in flight. One left behind by a fold
-        // that died before its commit is finished here rather than orphaned.
+        // Renamed before it is read: a shell appending at that moment opens
+        // the path afresh.
         let taking = if is_journal(name) {
-            // The name carries our pid, so a live journal can never be renamed
-            // onto one an earlier fold took and has not finished with. A fixed
-            // `.folding` meant the second fold destroyed the first fold's
-            // unread copy and then read the survivor twice.
+            // The pid keeps this off a journal an earlier fold still holds.
             let taking = dir.join(format!("{name}.folding.{}", std::process::id()));
             if std::fs::rename(entry.path(), &taking).is_err() {
                 continue;
             }
-            // An empty one put back in its place. The shells make the journal
-            // 0600 once, at startup, and only append to it afterwards, so a
-            // fold that leaves the name free hands the making of the next one
-            // to a redirect - and a redirect takes the user's umask. Every
-            // session that folded once was writing the list of every command
-            // it ran, and where, to a file the whole machine could read.
+            // The shells make the journal 0600 at startup and only append
+            // after, so leaving the name free hands the next one to a redirect
+            // - and a redirect takes the user's umask.
             replace(&dir, name);
             taking
         } else if let Some(owner) = folding_owner(name) {
-            // One left behind by a fold that died before its commit. Only once
-            // the process that took it is gone, or two folds running at the
-            // same time would both read it and count every line twice.
+            // Left by a fold that died. Only once its taker is gone, or two
+            // folds would count every line twice.
             if owner == std::process::id() || alive(owner) {
                 continue;
             }
@@ -860,8 +816,8 @@ pub(crate) fn fold(writing: &mut store::Editing) -> Vec<std::path::PathBuf> {
         } else {
             continue;
         };
-        // Bytes, not text: one directory name that is not UTF-8 would otherwise
-        // throw away every other line in the file along with it.
+        // Bytes, not text: one non-UTF-8 directory name would throw away every
+        // other line in the file with it.
         let Ok(part) = std::fs::read(&taking) else {
             continue;
         };
@@ -872,10 +828,7 @@ pub(crate) fn fold(writing: &mut store::Editing) -> Vec<std::path::PathBuf> {
         mine.push(taking);
     }
     for (text, at) in taken {
-        // Past the cap this is a runaway rather than a session, so it is taken
-        // as far as the cap and the rest is set aside for the next fold.
-        // Dropping the tail would be discarding lines nobody has read, which is
-        // the whole thing this function is careful not to do.
+        // Past the cap the rest is set aside for the next fold, not dropped.
         let (head, rest) = split_at_limit(&text);
         apply(writing, head, at);
         if !rest.is_empty() {
@@ -885,7 +838,6 @@ pub(crate) fn fold(writing: &mut store::Editing) -> Vec<std::path::PathBuf> {
     mine
 }
 
-/// The first `FOLD_LIMIT` lines, and whatever is left after them.
 fn split_at_limit(text: &str) -> (&str, &str) {
     match text.match_indices('\n').nth(FOLD_LIMIT - 1) {
         Some((end, _)) => text.split_at(end + 1),
@@ -893,7 +845,6 @@ fn split_at_limit(text: &str) -> (&str, &str) {
     }
 }
 
-/// What one fold would not take, kept where the next one will find it.
 fn spill(dir: &std::path::Path, rest: &str) {
     use std::os::unix::fs::OpenOptionsExt;
     let path = dir.join(format!("journal.rest.{}", std::process::id()));
@@ -911,10 +862,7 @@ pub(crate) fn apply(db_store: &mut Store, text: &str, unstamped: u64) {
     }
 
     let ceiling = store::now();
-    // Two hundred lines of the same command should cost one PATH sweep and one
-    // `canonicalize`, not two hundred of each: without this a fold is a visible
-    // stutter every time the buffer fills.
-    let mut installed: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    // One `canonicalize` per directory, not per line. `on_path` memoizes too.
     let mut real: std::collections::HashMap<String, std::path::PathBuf> =
         std::collections::HashMap::new();
     for line in text.lines().take(FOLD_LIMIT) {
@@ -928,34 +876,25 @@ pub(crate) fn apply(db_store: &mut Store, text: &str, unstamped: u64) {
         ) else {
             continue;
         };
-        // Clamped: a clock that was wrong when the line was written would
-        // otherwise leave a rank permanently multiplied by the within-the-hour
-        // bucket, and `last` only ever moves forward.
+        // Clamped: a wrong clock would stick a rank in the hour bucket.
         let at = match stamp.parse().unwrap_or(0) {
             0 => unstamped,
             stamped => stamped,
         }
-        // `max(1)` on the ceiling too: a box whose clock is still at the epoch
-        // would otherwise hand `clamp` a range with its floor above its top.
+        // `max(1)`: a clock at the epoch would invert `clamp`'s range.
         .clamp(1, ceiling.max(1));
         let kind = match Shell::parse(tag) {
             Some(shell) => Kind::Shell(shell),
-            // Checked now rather than then: a tool uninstalled since is dropped,
-            // which is the answer `record` would have given at the time.
-            None if *installed
-                .entry(word.to_owned())
-                .or_insert_with(|| shell::on_path(word)) =>
-            {
-                Kind::External
-            }
+            // Checked now: a tool uninstalled since is dropped.
+            None if shell::on_path(word) => Kind::External,
             None => continue,
         };
         if db_store.is_ignored(word) {
             continue;
         }
         db_store.absorb(word, kind, 1.0, at);
-        // Canonical, because every other reader and writer of this table uses
-        // `current_dir`, and the shell's `$PWD` keeps the symlinks in.
+        // Canonical: other readers use `current_dir`, and `$PWD` keeps the
+        // symlinks in.
         let dir = real.entry(dir.to_owned()).or_insert_with(|| {
             std::fs::canonicalize(dir).unwrap_or_else(|_| std::path::PathBuf::from(dir))
         });
@@ -966,8 +905,8 @@ pub(crate) fn apply(db_store: &mut Store, text: &str, unstamped: u64) {
     }
 }
 
-/// A shell that never mistypes anything would buffer for ever, so the hooks ask
-/// for this every so often. It writes nothing else.
+/// A shell that never mistypes would buffer for ever, so the hooks ask for
+/// this every so often.
 pub(crate) fn flush() -> Result<i32, Fail> {
     let db = store::db_path();
     let mut db_store = store::edit(&db);
@@ -976,7 +915,6 @@ pub(crate) fn flush() -> Result<i32, Fail> {
     Ok(0)
 }
 
-/// Anything past this in one fold is a runaway rather than a shell session.
 const FOLD_LIMIT: usize = 20_000;
 
 pub(crate) fn record(args: &[String]) -> Result<i32, Fail> {
@@ -993,7 +931,6 @@ pub(crate) fn record(args: &[String]) -> Result<i32, Fail> {
             Some(shell) => Kind::Shell(shell),
             None => fail!("--kind shell needs --shell"),
         },
-        // The single place that decides what may ever be suggested.
         _ if shell::on_path(word) => Kind::External,
         _ => return Ok(0),
     };
@@ -1009,8 +946,7 @@ pub(crate) fn record(args: &[String]) -> Result<i32, Fail> {
         if let Ok(dir) = std::env::current_dir() {
             db_store.bump_in(store::dir_key(&dir), word, 1.0);
         }
-        // Only learned once it has worked: `git sttaus` must never teach us that
-        // `sttaus` is a thing git does.
+        // Only once it worked, or `sttaus` becomes a thing git does.
         if status == Some(0) {
             if let Some(call) = subcommand_call(&line) {
                 let verb = &line[call.verb.0..call.verb.1];
@@ -1123,9 +1059,7 @@ mod tests {
     #[test]
     fn a_command_that_costs_something_is_never_run_to_read_its_help() {
         let store = Store::default();
-        // `sh` stands in for the ordinary case: on PATH, takes no verbs yet,
-        // and worth asking. `rm` and `sudo` are the same in every way except
-        // what running them by accident costs.
+        // `sh` is the ordinary case: on PATH, no verbs yet, worth asking.
         assert!(worth_asking(&store, "sh", "sttaus"));
         for dangerous in ["rm", "sudo", "dd", "shutdown", "mkfs.ext4"] {
             assert!(

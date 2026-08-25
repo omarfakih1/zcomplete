@@ -19,16 +19,15 @@ impl Tty {
     }
 
     pub fn open_as(borrowed: bool) -> Option<Tty> {
-        // Opening /dev/tty fails with ENXIO when there is no controlling terminal,
-        // which is how CI and cron are detected. isatty(0) would be wrong: stdin
-        // is a pipe in the case we care about.
+        // ENXIO with no controlling terminal, which is how CI and cron are
+        // detected. isatty(0) would be wrong: stdin is a pipe here.
         let file = File::options()
             .read(true)
             .write(true)
             .open("/dev/tty")
             .ok()?;
-        // A background job can open a terminal but owns none: asking there stops
-        // the job and leaves a [Y/n] nobody can answer without fg.
+        // A background job can open a terminal but owns none: asking there
+        // stops the job and leaves a [Y/n] nobody can answer without fg.
         if unsafe { libc::tcgetpgrp(file.as_raw_fd()) } != unsafe { libc::getpgrp() } {
             return None;
         }
@@ -44,11 +43,10 @@ impl Tty {
 
     pub fn say(&mut self, text: &str) {
         if self.borrowed && !self.disturbed {
-            // Ask on the alternate screen, the way fzf does: the terminal restores the
-            // primary one byte for byte. Save-and-restore does not work, because the
-            // question moves the cursor to a row the editor never hears about.
-            // Published first: a signal landing between the two would otherwise
-            // leave the alternate screen up with nothing recorded to undo it.
+            // The alternate screen, the way fzf does it: save-and-restore
+            // fails because the question moves the cursor to a row the editor
+            // never hears about. Published first, or a signal landing between
+            // the two leaves it up with no way to undo it.
             ALTERNATE.store(self.file.as_raw_fd(), Ordering::Release);
             let _ = self.file.write_all(b"\x1b[?1049h\x1b[H");
             self.disturbed = true;
@@ -74,13 +72,12 @@ impl Tty {
             _ => return None,
         };
         if first == 0x1b {
-            // An arrow key is three bytes; the shell would read the tail as typing.
+            // An arrow key is three bytes; the tail would read as typing.
             Raw::poll_briefly(&self.file);
             let _ = self.file.read(&mut [0u8; 16]);
         }
-        // Anything else left in the buffer stays there on purpose. Typing the
-        // next command while a question is up is a thing people do, and eating
-        // it to catch the `es` in an `yes` would cost more than it saves.
+        // Anything else in the buffer stays: people type ahead, and eating it
+        // to catch the `es` in a `yes` costs more than it saves.
         Some(first as char)
     }
 
@@ -144,13 +141,13 @@ struct Saved {
     state: libc::termios,
 }
 
-/// So a signal mid-prompt can put the terminal back. Leaving a shell
+/// So a signal mid-prompt can put the terminal back: leaving a shell
 /// non-echoing is the worst failure this could have.
 static PENDING: AtomicPtr<Saved> = AtomicPtr::new(ptr::null_mut());
 static ALTERNATE: AtomicI32 = AtomicI32::new(-1);
 
-/// SIGABRT included: the release profile aborts on panic rather than
-/// unwinding, so `Raw::drop` is not what puts the terminal back.
+/// SIGABRT included: the release profile aborts on panic, so `Raw::drop` is
+/// not what puts the terminal back.
 const RESCUED: [libc::c_int; 5] = [
     libc::SIGINT,
     libc::SIGTERM,
@@ -229,7 +226,7 @@ extern "C" fn rescue(signal: libc::c_int) {
     }
     let saved = PENDING.swap(ptr::null_mut(), Ordering::AcqRel);
     if !saved.is_null() {
-        // Not freed: the allocator is not signal-safe and we are about to die.
+        // Not freed: the allocator is not signal-safe.
         unsafe { libc::tcsetattr((*saved).fd, libc::TCSANOW, &(*saved).state) };
     }
     unsafe {

@@ -10,7 +10,7 @@ macro_rules! fail {
     ($($arg:tt)*) => { return Err(Fail(format!($($arg)*))) };
 }
 
-// After the macro: `fail!` is only in scope for modules declared below it.
+// `fail!` is only in scope for modules declared below it.
 mod admin;
 mod correct;
 mod matcher;
@@ -25,8 +25,7 @@ pub(crate) const FOUND: i32 = 0;
 pub(crate) const NO_MATCH: i32 = 1;
 pub(crate) const DECLINED: i32 = 3;
 pub(crate) const DISABLED: i32 = 4;
-/// The hook found the answer in a fork that cannot run it. Passed back out so
-/// the real shell does the correction at the next prompt.
+/// Found in a fork that cannot run it; the real shell does it next prompt.
 pub(crate) const DEFERRED: i32 = 5;
 
 pub struct Fail(String);
@@ -149,27 +148,22 @@ fn init(args: &[String]) -> Result<i32, Fail> {
     let (flags, operands) = split_flags(args);
     reject_unknown(&flags, &["--zsh", "--bash", "--fish", "--all"])?;
 
-    // `--zsh` sets the shell up, `zsh` prints what the setup line runs. The
-    // flag is for a person doing this once; the bare word is for the rc file
-    // doing it on every shell, and printing anything else there would be
-    // eval'd.
+    // `--zsh` sets the shell up; bare `zsh` prints what the rc line eval's,
+    // so nothing else may be printed there.
+    let sweep = flags.iter().any(|f| f == "--all");
     let asked: Vec<Shell> = [Shell::Zsh, Shell::Bash, Shell::Fish]
         .into_iter()
         .filter(|shell| {
-            let all = flags.iter().any(|f| f == "--all");
-            all || flags
-                .iter()
-                .any(|f| f.trim_start_matches('-') == shell.name())
+            sweep
+                || flags
+                    .iter()
+                    .any(|f| f.trim_start_matches('-') == shell.name())
         })
         .collect();
     if !asked.is_empty() {
         if let Some(name) = operands.first() {
             fail!("init takes a shell or a --shell flag, not both (got '{name}')")
         }
-        // `--all` means every shell on this machine, so one that is not here is
-        // not a problem. A shell named outright was asked for by someone who
-        // knows it is coming, so it gets written either way.
-        let sweep = flags.iter().any(|f| f == "--all");
         for shell in asked {
             install(shell, sweep)?;
         }
@@ -182,8 +176,8 @@ fn init(args: &[String]) -> Result<i32, Fail> {
     let Some(shell) = Shell::parse(name) else {
         fail!("unsupported shell '{name}' (zsh, bash and fish are supported)")
     };
-    // The hook appends to this directory from the first command onward, and a
-    // redirect cannot create it. This runs once per shell, before any of that.
+    // The hook appends here from the first command on, and a redirect cannot
+    // create the directory.
     let _ = std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -192,7 +186,6 @@ fn init(args: &[String]) -> Result<i32, Fail> {
     Ok(0)
 }
 
-/// The line a shell needs in its config to load the integration.
 pub(crate) fn setup_line(shell: Shell) -> &'static str {
     match shell {
         Shell::Zsh => "eval \"$(zcomplete init zsh)\"",
@@ -201,7 +194,6 @@ pub(crate) fn setup_line(shell: Shell) -> &'static str {
     }
 }
 
-/// Adds the setup line to a shell's config, once.
 fn install(shell: Shell, only_if_present: bool) -> Result<(), Fail> {
     use std::io::Write;
 
@@ -209,8 +201,7 @@ fn install(shell: Shell, only_if_present: bool) -> Result<(), Fail> {
     let Some(target) = files.first().cloned() else {
         fail!("cannot find your home directory, so there is no config to write to")
     };
-    // Any of them counts as done: bash reads whichever of the two it is given,
-    // and adding the line twice would run the integration twice.
+    // Any of them counts as done: bash reads whichever it is given.
     if let Some(had) = files.iter().find(|rc| {
         std::fs::read_to_string(rc).is_ok_and(|text| {
             text.lines()
@@ -229,8 +220,7 @@ fn install(shell: Shell, only_if_present: bool) -> Result<(), Fail> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(at(parent))?;
     }
-    // Appended, and the file is never rewritten: everything else in there is
-    // the user's, and a config lost to this would be a bad trade for a line.
+    // Appended, never rewritten: the rest of the file is the user's.
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)

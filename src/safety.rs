@@ -1,8 +1,7 @@
 //! Not "is this dangerous" but "would running it by accident cost something
 //! you cannot get back".
 
-/// Ordinary use is already irreversible, which is why plain `rm` is here and
-/// `rmdir`, which refuses a non-empty directory, is not.
+/// Irreversible in ordinary use, which is why `rm` is here and `rmdir` is not.
 const ALWAYS: &[(&str, &str)] = &[
     ("rm", "deletes files"),
     ("shred", "overwrites files in place"),
@@ -116,11 +115,8 @@ fn removes_something(args: &[String]) -> Option<&'static str> {
     args.iter()
         .take_while(|a| *a != "--")
         .filter(|a| !a.starts_with('-'))
-        // Six rather than three: a flag that takes a value leaves that value
-        // sitting where a subcommand would be, and `docker --context a --host b
-        // container rm x` used to run the whole budget out before reaching `rm`.
-        // The words this can match are a fixed list of destructive verbs, so
-        // reading further costs an occasional extra question and nothing worse.
+        // Six, because a flag's value sits where a subcommand would:
+        // `docker --context a --host b container rm x`.
         .take(6)
         .find_map(|verb| match verb.as_str() {
             "rm" | "rmi" | "remove" | "delete" | "destroy" | "prune" | "uninstall" => {
@@ -248,11 +244,8 @@ fn sub(args: &[String], name: &str) -> bool {
     args.iter().take_while(|a| *a != "--").any(|a| a == name)
 }
 
-/// The whole cluster has to be flags before any letter counts, or the `f` in
-/// `-f build.log` reads as `--force`.
-/// SIGKILL under any of its spellings: `-9`, `-KILL`, `-SIGKILL`, `-s KILL`,
-/// `--signal KILL`, `--signal=KILL`. The value has to be read rather than the
-/// flag counted, or `kill -s TERM` would be treated the same as `kill -9`.
+/// SIGKILL however it is spelled. The value is read, not the flag counted, or
+/// `kill -s TERM` would read as `kill -9`.
 fn kills_outright(args: &[String]) -> bool {
     let mut expecting = false;
     for arg in args.iter().take_while(|a| *a != "--") {
@@ -334,7 +327,6 @@ mod tests {
         assert!(concern("kill", "-s KILL 4321").is_some());
         assert!(concern("pkill", "--signal KILL node").is_some());
         assert!(concern("pkill", "--signal=SIGKILL node").is_some());
-        // A gentler signal is the process's own business.
         assert!(concern("kill", "4321").is_none());
         assert!(concern("kill", "-s TERM 4321").is_none());
         assert!(concern("kill", "-15 4321").is_none());
